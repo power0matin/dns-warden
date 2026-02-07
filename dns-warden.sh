@@ -118,7 +118,8 @@ trap cleanup EXIT
 # Helpers
 # ---------------------------
 is_interactive() {
-  [[ -t 0 && -t 1 ]]
+  # Works for curl|bash too: stdin may be a pipe, but /dev/tty is available.
+  [[ -t 1 && -r /dev/tty && -w /dev/tty ]]
 }
 
 ensure_dirs() {
@@ -136,14 +137,17 @@ detect_script_dir() {
 
 detect_ubuntu_or_exit() {
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release. This script requires Ubuntu 20.04+."
-  # shellcheck disable=SC1091
-  . /etc/os-release
 
-  if [[ "${ID:-}" != "ubuntu" ]]; then
-    die "Unsupported OS: ID='${ID:-unknown}'. This script supports Ubuntu 20.04+ only."
+  local os_id os_ver
+  mapfile -t _os < <(. /etc/os-release && printf '%s\n%s\n' "${ID:-}" "${VERSION_ID:-}")
+  os_id="${_os[0]:-}"
+  os_ver="${_os[1]:-0}"
+
+  if [[ "${os_id}" != "ubuntu" ]]; then
+    die "Unsupported OS: ID='${os_id:-unknown}'. This script supports Ubuntu 20.04+ only."
   fi
 
-  local ver="${VERSION_ID:-0}"
+  local ver="${os_ver}"
   local major="${ver%%.*}"
   if [[ "${major}" =~ ^[0-9]+$ ]]; then
     if (( major < 20 )); then
@@ -291,7 +295,7 @@ wt_msg() {
   local title="$1"; shift
   local text="$1"; shift || true
   if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --title "${title}" --msgbox "${text}" 10 72
+    whiptail --title "${title}" --msgbox "${text}" 10 72 </dev/tty
   else
     log_info "${title}: ${text}"
   fi
@@ -301,7 +305,7 @@ wt_textbox() {
   local title="$1"
   local file="$2"
   if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --title "${title}" --scrolltext --textbox "${file}" 25 92
+    whiptail --title "${title}" --scrolltext --textbox "${file}" 25 92 </dev/tty
   else
     cat "${file}"
   fi
@@ -311,7 +315,7 @@ wt_yesno() {
   local title="$1"
   local text="$2"
   if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    if whiptail --title "${title}" --yesno "${text}" 10 72; then
+    if whiptail --title "${title}" --yesno "${text}" 10 72 </dev/tty; then
       return 0
     else
       return 1
@@ -334,7 +338,7 @@ wt_yesno() {
 
 wt_menu_main() {
   local choice=""
-  choice="$(whiptail --title "DNS Warden (Ubuntu) v${VERSION}" \
+  choice="$(whiptail --title "DNS Warden (Ubuntu) v${APP_VERSION}" \
     --menu "Select an action:" 18 72 10 \
     "1" "Test DNS list" \
     "2" "Select & Apply DNS" \
@@ -342,7 +346,7 @@ wt_menu_main() {
     "4" "Edit DNS list" \
     "5" "Restore backup" \
     "6" "Exit" \
-    3>&1 1>&2 2>&3)" || true
+    3>&1 1>&2 2>&3 </dev/tty)" || true
 
   printf "%s" "${choice}"
 }
@@ -497,10 +501,10 @@ select_best_dns_tui() {
   done < "${sorted}"
 
   local chosen=""
-  chosen="$(whiptail --title "Select DNS to apply" \
+    chosen="$(whiptail --title "Select DNS to apply" \
     --radiolist "Choose one DNS endpoint:" 20 92 10 \
     "${opts[@]}" \
-    3>&1 1>&2 2>&3)" || true
+    3>&1 1>&2 2>&3 </dev/tty)" || true
 
   printf "%s" "${chosen}"
 }
@@ -874,7 +878,7 @@ test_dns_cli() {
 # ---------------------------
 usage() {
   cat <<EOF
-${SCRIPT_NAME} v${VERSION} - Ubuntu-only DNS tester & switcher (whiptail TUI)
+${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (whiptail TUI)
 
 Usage:
   sudo bash ${SCRIPT_NAME}
