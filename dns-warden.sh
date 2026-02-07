@@ -337,33 +337,78 @@ wt_yesno() {
   fi
 }
 
-wt_menu_main() {
-  local prompt
-  prompt=$(
-    cat <<EOF
-DNS Warden — Interactive DNS Benchmark & Switcher
+print_banner() {
+  clear || true
 
-List file: ${LIST_FILE}
-Backups:   ${BACKUP_DIR}
-Ping:      count=${PING_COUNT} timeout=${PING_TIMEOUT}s
+  # Simple ASCII header (rathole-style)
+  printf "%s\n" "    ____  _   _ ____        _       __        __            _           "
+  printf "%s\n" "   |  _ \| \ | / ___|      | |      \ \      / /__  _ __ __| | ___ _ __ "
+  printf "%s\n" "   | | | |  \| \___ \ _____| |       \ \ /\ / / _ \| '__/ _\` |/ _ \ '__|"
+  printf "%s\n" "   | |_| | |\  |___) |_____| |___     \ V  V / (_) | | | (_| |  __/ |   "
+  printf "%s\n" "   |____/|_| \_|____/      |_____|     \_/\_/ \___/|_|  \__,_|\___|_|   "
+  echo
 
-Select an action:
-EOF
-  )
+  printf "Version: %s\n" "${APP_VERSION}"
+  printf "List file: %s\n" "${LIST_FILE}"
+  printf "Backups: %s\n" "${BACKUP_DIR}"
+  printf "Ping: count=%s timeout=%ss\n" "${PING_COUNT}" "${PING_TIMEOUT}"
+  echo
 
+  if [[ -L /etc/resolv.conf ]]; then
+    printf "resolv.conf: symlink -> %s\n" "$(readlink /etc/resolv.conf || true)"
+  else
+    printf "resolv.conf: regular file\n"
+  fi
+  echo "------------------------------------------------------------"
+  echo
+}
+
+menu_read_choice() {
   local choice=""
-  choice="$(whiptail --title "DNS Warden v${APP_VERSION}" \
-    --menu "${prompt}" 20 86 10 \
-    "test"     "Test DNS list (ping + rank)" \
-    "apply"    "Select & Apply DNS (safe / systemd-resolved aware)" \
-    "current"  "View current DNS config (/etc/resolv.conf + resolver status)" \
-    "edit"     "Edit DNS list (${LIST_FILE})" \
-    "restore"  "Restore backup (${BACKUP_DIR})" \
-    "help"     "Usage / non-interactive commands" \
-    "exit"     "Exit" \
-    3>&1 1>&2 2>&3 </dev/tty)" || true
+  printf "1. Test DNS list (ping + rank)\n"
+  printf "2. Select & Apply DNS\n"
+  printf "3. View current DNS config\n"
+  printf "4. Edit DNS list\n"
+  printf "5. Restore backup\n"
+  printf "6. Help\n"
+  printf "0. Exit\n"
+  echo
+  printf "Enter your choice [0-6]: "
+
+  # Read from /dev/tty so it works even in curl|bash
+  if ! read -r choice </dev/tty; then
+    printf ""
+    return 0
+  fi
 
   printf "%s" "${choice}"
+}
+
+show_help_screen() {
+  clear || true
+  cat <<EOF
+DNS Warden v${APP_VERSION}
+
+Interactive:
+  sudo ./dns-warden.sh
+
+Curl:
+  curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/dns-warden.sh | sudo bash
+
+Non-interactive:
+  --test
+    sudo ./dns-warden.sh --test
+
+  --apply <dns> [--method auto|resolved|force] --yes
+    sudo ./dns-warden.sh --apply 1.1.1.1 --method auto --yes
+
+Files:
+  DNS list: ${LIST_FILE}
+  Backups:  ${BACKUP_DIR}
+
+Press Enter to return...
+EOF
+  read -r _ </dev/tty || true
 }
 
 # ---------------------------
@@ -954,68 +999,65 @@ parse_args() {
 # ---------------------------
 menu_loop() {
   while true; do
+    print_banner
+
     local choice
-    choice="$(wt_menu_main)"
+    choice="$(menu_read_choice)"
 
     case "${choice}" in
-      test)
+      1)
         test_dns_list
-        wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
+        clear || true
+        cat "${LAST_TABLE_FILE}"
+        echo
+        echo "Press Enter to continue..."
+        read -r _ </dev/tty || true
         ;;
 
-      apply)
+      2)
         test_dns_list
-        wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
+        clear || true
+        cat "${LAST_TABLE_FILE}"
+        echo
+
+        # Keep your existing selector (still whiptail-based if available)
+        # If you later want a numbered selector too, tell me and I'll convert it.
         local selected
         selected="$(select_best_dns_tui)"
         if [[ -n "${selected}" ]]; then
           apply_dns_flow_tui "${selected}"
+        else
+          echo "No DNS selected. Press Enter to continue..."
+          read -r _ </dev/tty || true
         fi
         ;;
 
-      current)
+      3)
         view_current_dns_config
         ;;
 
-      edit)
+      4)
         edit_dns_list
+        echo
+        echo "Press Enter to continue..."
+        read -r _ </dev/tty || true
         ;;
 
-      restore)
+      5)
         restore_backup_tui
         ;;
 
-      help)
-        local hf="${TMP_DIR}/help.txt"
-        cat > "${hf}" <<EOF
-DNS Warden v${APP_VERSION}
-
-Interactive:
-  sudo ./dns-warden.sh
-
-Curl:
-  curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/dns-warden.sh | sudo bash
-
-Non-interactive:
-  --test
-    sudo ./dns-warden.sh --test
-
-  --apply <dns> [--method auto|resolved|force] --yes
-    sudo ./dns-warden.sh --apply 1.1.1.1 --method auto --yes
-
-Files:
-  DNS list: ${LIST_FILE}
-  Backups:  ${BACKUP_DIR}
-EOF
-        wt_textbox "Help" "${hf}"
+      6)
+        show_help_screen
         ;;
 
-      exit|"")
+      0|"")
         break
         ;;
 
       *)
-        break
+        echo "Invalid choice. Press Enter to continue..."
+        read -r _ </dev/tty || true
         ;;
     esac
   done
@@ -1051,10 +1093,9 @@ main() {
   fi
 
   if (( INTERACTIVE == 1 )); then
-    ensure_whiptail
-    if (( HAVE_WHIPTAIL != 1 )); then
-      die "whiptail is not available. Install it: apt-get update && apt-get install -y whiptail"
-    fi
+    # Main menu is terminal-based now (rathole-style).
+    # whiptail is optional for some sub-screens (textbox/radiolist) but not required.
+    ensure_whiptail || true
     menu_loop
   else
     usage
