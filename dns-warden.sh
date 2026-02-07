@@ -1,19 +1,11 @@
 #!/usr/bin/env bash
 # DNS Warden - Ubuntu-only DNS tester & switcher (TUI via whiptail)
-#
-# Supports:
-# - Test DNS endpoints from a list file (IPv4/IPv6/hostnames)
-# - Show sorted results (loss/avg/score)
-# - Select & apply DNS safely (systemd-resolved aware)
-# - Backup/restore /etc/resolv.conf with timestamp + metadata
-#
 # Safe for: Ubuntu 20.04+
 # Shellcheck-friendly.
 
 # ---------------------------
 # Loader: sudo re-exec support
 # ---------------------------
-# Enables "curl ... | bash" to auto-rerun with sudo by capturing the script into a temp file.
 if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   export DNS_WARDEN_LAUNCHED=1
 
@@ -21,7 +13,6 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   _script_path="${BASH_SOURCE[0]:-}"
 
   if [[ -z "${_script_path}" || ! -r "${_script_path}" ]]; then
-    # Likely running via stdin (curl|bash). Capture the rest of the script.
     _tmp="$(mktemp -t dns-warden.XXXXXX)"
     cat > "${_tmp}"
     chmod 0700 "${_tmp}"
@@ -38,7 +29,6 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
       exec bash "${_tmp}" "$@"
     fi
   else
-    # Running from a real file path.
     if [[ "${_euid}" -ne 0 ]]; then
       if command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "${_script_path}" "$@"
@@ -61,29 +51,24 @@ VERSION="1.0.0"
 SCRIPT_NAME="dns-warden.sh"
 APP_VERSION="${VERSION}"
 
-# Defaults (overridable by flags)
 PING_COUNT_DEFAULT=3
 PING_TIMEOUT_DEFAULT=2
 
 PING_COUNT="${PING_COUNT_DEFAULT}"
 PING_TIMEOUT="${PING_TIMEOUT_DEFAULT}"
 
-# Paths
 SCRIPT_DIR=""
 CONFIG_DIR="/etc/dns-warden"
 BACKUP_DIR="/var/backups/dns-warden"
-LIST_FILE="" # resolved at runtime
+LIST_FILE=""
 
-# UI / mode
 INTERACTIVE=0
 HAVE_WHIPTAIL=0
 
-# State
 TMP_DIR=""
 LAST_RESULTS_FILE=""
 LAST_TABLE_FILE=""
 
-# CLI flags
 FLAG_TEST_ONLY=0
 FLAG_APPLY_DNS=""
 FLAG_METHOD=""     # resolved|force|auto
@@ -91,7 +76,7 @@ FLAG_YES=0
 FLAG_LIST_OVERRIDE=""
 
 # ---------------------------
-# Logging (non-TUI)
+# Logging
 # ---------------------------
 _color() {
   local code="$1"
@@ -99,7 +84,6 @@ _color() {
     printf "\033[%sm" "${code}"
   fi
 }
-
 log_info()  { printf "%s[INFO]%s %s\n"  "$(_color 36)" "$(_color 0)" "$*"; }
 log_warn()  { printf "%s[WARN]%s %s\n"  "$(_color 33)" "$(_color 0)" "$*"; }
 log_error() { printf "%s[ERR ]%s %s\n"  "$(_color 31)" "$(_color 0)" "$*"; }
@@ -119,7 +103,6 @@ trap cleanup EXIT
 # Helpers
 # ---------------------------
 is_interactive() {
-  # Works for curl|bash too: stdin may be a pipe, but /dev/tty is available.
   [[ -t 1 && -r /dev/tty && -w /dev/tty ]]
 }
 
@@ -207,9 +190,12 @@ is_ipv4() {
   return 0
 }
 
+# Not a perfect IPv6 validator, but less dumb than "*:*"
 is_ipv6() {
   local ip="$1"
-  [[ "${ip}" == *:* ]]
+  [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "${ip}" == *:* ]] || return 1
+  return 0
 }
 
 resolve_prefer_v4_then_v6() {
@@ -316,11 +302,8 @@ wt_yesno() {
   local title="$1"
   local text="$2"
   if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    if whiptail --title "${title}" --yesno "${text}" 10 72 </dev/tty; then
-      return 0
-    else
-      return 1
-    fi
+    whiptail --title "${title}" --yesno "${text}" 10 72 </dev/tty
+    return $?
   fi
 
   if (( FLAG_YES == 1 )); then
@@ -339,8 +322,6 @@ wt_yesno() {
 
 print_banner() {
   clear || true
-
-  # Simple ASCII header (rathole-style)
   printf "%s\n" "    ____  _   _ ____        _       __        __            _           "
   printf "%s\n" "   |  _ \| \ | / ___|      | |      \ \      / /__  _ __ __| | ___ _ __ "
   printf "%s\n" "   | | | |  \| \___ \ _____| |       \ \ /\ / / _ \| '__/ _\` |/ _ \ '__|"
@@ -365,7 +346,6 @@ print_banner() {
 
 menu_read_choice() {
   local choice=""
-
   {
     printf "1. Test DNS list (ping + rank)\n"
     printf "2. Select & Apply DNS\n"
@@ -382,8 +362,6 @@ menu_read_choice() {
     printf ""
     return 0
   fi
-
-  # فقط انتخاب روی stdout برگرده تا command-substitution کار کنه
   printf "%s" "${choice}"
 }
 
@@ -430,10 +408,7 @@ read_dns_list() {
     entries+=("${line}")
   done < "${file}"
 
-  if (( ${#entries[@]} == 0 )); then
-    die "DNS list is empty after filtering comments/blank lines: ${file}"
-  fi
-
+  (( ${#entries[@]} > 0 )) || die "DNS list is empty after filtering comments/blank lines: ${file}"
   printf "%s\n" "${entries[@]}"
 }
 
@@ -443,8 +418,8 @@ read_dns_list() {
 ping_one() {
   local endpoint="$1"
 
-  local family="" ip_for_ping="" ping_cmd="" ping_args=()
-  local resolved=""
+  local family="" ip_for_ping="" display="${endpoint}"
+  local resolved="" ip=""
 
   if is_ipv4 "${endpoint}"; then
     family="4"
@@ -455,13 +430,15 @@ ping_one() {
   else
     if resolved="$(resolve_prefer_v4_then_v6 "${endpoint}" 2>/dev/null)"; then
       family="$(awk '{print $1}' <<< "${resolved}")"
-      ip_for_ping="${endpoint}"
+      ip="$(awk '{print $2}' <<< "${resolved}")"
+      ip_for_ping="${ip}"
     else
       family="?"
       ip_for_ping="${endpoint}"
     fi
   fi
 
+  local ping_cmd="" ping_args=()
   if [[ "${family}" == "6" ]]; then
     if have_command ping6; then
       ping_cmd="ping6"
@@ -475,15 +452,15 @@ ping_one() {
     ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
   fi
 
-  local out rc
-  out="$("${ping_cmd}" "${ping_args[@]}" "${ip_for_ping}" 2>&1 || true)"
+  local out rc=0
+  set +e
+  out="$("${ping_cmd}" "${ping_args[@]}" "${ip_for_ping}" 2>&1)"
   rc=$?
+  set -e
 
   local loss avg score
   loss="$(awk '/packet loss/ {for (i=1;i<=NF;i++) if ($i ~ /%/) {gsub(/%/,"",$i); print $i; exit}}' <<< "${out}" || true)"
-  if [[ -z "${loss}" ]]; then
-    loss="100"
-  fi
+  [[ -n "${loss}" ]] || loss="100"
 
   avg="$(awk '
     /rtt min\/avg\/max\/mdev/ || /round-trip min\/avg\/max\/stddev/ {
@@ -493,14 +470,11 @@ ping_one() {
       print b[2]
       exit
     }' <<< "${out}" || true)"
-
-  if [[ -z "${avg}" ]]; then
-    avg="9999"
-  fi
+  [[ -n "${avg}" ]] || avg="9999"
 
   score="$(awk -v a="${avg}" -v l="${loss}" 'BEGIN{printf "%.3f", a + (l*1000)}')"
 
-  printf "%s|%s|%s|%s|%s\n" "${endpoint}" "${family}" "${loss}" "${avg}" "${score}"
+  printf "%s|%s|%s|%s|%s\n" "${display}" "${family}" "${loss}" "${avg}" "${score}"
   return "${rc}"
 }
 
@@ -509,12 +483,10 @@ test_dns_list() {
   mapfile -t entries < <(read_dns_list "${LIST_FILE}")
 
   : > "${LAST_RESULTS_FILE}"
-
   local e
   for e in "${entries[@]}"; do
     ping_one "${e}" >> "${LAST_RESULTS_FILE}" || true
   done
-
   build_results_table
 }
 
@@ -543,8 +515,39 @@ build_results_table() {
   } > "${LAST_TABLE_FILE}"
 }
 
+select_best_dns_fallback() {
+  # Simple numbered chooser from sorted results (no whiptail required)
+  local sorted="${TMP_DIR}/results.sorted"
+  sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
+
+  local -a endpoints=()
+  local endpoint family loss avg score
+  local i=0
+
+  echo "Select DNS to apply:" >/dev/tty
+  while IFS='|' read -r endpoint family loss avg score; do
+    i=$((i+1))
+    endpoints+=("${endpoint}")
+    printf "%2d) %-42s  loss=%s%% avg=%sms score=%s\n" "${i}" "${endpoint}" "${loss}" "${avg}" "${score}" >/dev/tty
+  done < "${sorted}"
+
+  printf "\nEnter number [1-%d] (or empty to cancel): " "${i}" >/dev/tty
+  local ans=""
+  read -r ans </dev/tty || true
+  [[ -n "${ans}" ]] || { printf ""; return 0; }
+  [[ "${ans}" =~ ^[0-9]+$ ]] || { printf ""; return 0; }
+  (( ans >= 1 && ans <= i )) || { printf ""; return 0; }
+
+  printf "%s" "${endpoints[$((ans-1))]}"
+}
+
 select_best_dns_tui() {
   [[ -s "${LAST_RESULTS_FILE}" ]] || test_dns_list
+
+  if (( HAVE_WHIPTAIL != 1 || INTERACTIVE != 1 )); then
+    select_best_dns_fallback
+    return 0
+  fi
 
   local sorted="${TMP_DIR}/results.sorted"
   sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
@@ -564,7 +567,7 @@ select_best_dns_tui() {
   done < "${sorted}"
 
   local chosen=""
-    chosen="$(whiptail --title "Select DNS to apply" \
+  chosen="$(whiptail --title "Select DNS to apply" \
     --radiolist "Choose one DNS endpoint:" 20 92 10 \
     "${opts[@]}" \
     3>&1 1>&2 2>&3 </dev/tty)" || true
@@ -577,29 +580,16 @@ select_best_dns_tui() {
 # ---------------------------
 resolv_conf_is_symlink() { [[ -L /etc/resolv.conf ]]; }
 
-resolv_conf_symlink_target() {
-  if resolv_conf_is_symlink; then
-    readlink /etc/resolv.conf
-  else
-    printf ""
-  fi
-}
-
 resolv_conf_symlink_managed_by_systemd() {
-  if ! resolv_conf_is_symlink; then
-    return 1
-  fi
+  resolv_conf_is_symlink || return 1
   local target
   target="$(readlink -f /etc/resolv.conf || true)"
   [[ "${target}" == /run/systemd/resolve/* ]]
 }
 
 systemd_resolved_active() {
-  if have_command systemctl; then
-    systemctl is-active --quiet systemd-resolved
-  else
-    return 1
-  fi
+  have_command systemctl || return 1
+  systemctl is-active --quiet systemd-resolved
 }
 
 backup_resolv_conf() {
@@ -632,7 +622,6 @@ backup_resolv_conf() {
 
 apply_force_resolv_conf() {
   local dns="$1"
-
   local backup
   backup="$(backup_resolv_conf)"
 
@@ -648,7 +637,6 @@ apply_force_resolv_conf() {
   chmod 0644 /etc/resolv.conf
 
   wt_msg "Applied" "Wrote /etc/resolv.conf with only:\n\nnameserver ${dns}\n\nBackup:\n${backup}"
-  return 0
 }
 
 write_resolved_dropin() {
@@ -676,7 +664,6 @@ EOF
 
 apply_via_systemd_resolved() {
   local dns="$1"
-
   ensure_dirs
 
   if ! systemd_resolved_active; then
@@ -713,38 +700,51 @@ verify_dns() {
       echo "FAILED: getent hosts google.com"
     fi
   } > "${out_file}"
-
   wt_textbox "Verification" "${out_file}"
+}
+
+choose_apply_method_fallback() {
+  # Only called when systemd-managed and whiptail isn't available
+  echo "/etc/resolv.conf is managed by systemd-resolved." >/dev/tty
+  echo "Choose how to apply DNS:" >/dev/tty
+  echo "  1) resolved  (recommended)" >/dev/tty
+  echo "  2) force     (break symlink)" >/dev/tty
+  echo "  0) cancel" >/dev/tty
+  printf "Enter choice [0-2]: " >/dev/tty
+  local ans=""
+  read -r ans </dev/tty || true
+  case "${ans}" in
+    1) printf "resolved" ;;
+    2) printf "force" ;;
+    *) printf "cancel" ;;
+  esac
 }
 
 apply_dns_flow_tui() {
   local selected="$1"
-
   local method="auto"
-  if [[ -n "${FLAG_METHOD}" ]]; then
-    method="${FLAG_METHOD}"
-  fi
+  [[ -n "${FLAG_METHOD}" ]] && method="${FLAG_METHOD}"
 
-  if resolv_conf_symlink_managed_by_systemd; then
-    if [[ "${method}" == "auto" ]]; then
-      local choice=""
+  if resolv_conf_symlink_managed_by_systemd && [[ "${method}" == "auto" ]]; then
+    local choice=""
+    if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
       choice="$(whiptail --title "systemd-resolved detected" \
         --menu "/etc/resolv.conf is managed by systemd-resolved.\n\nChoose how to apply DNS:" 16 80 3 \
         "resolved" "Recommended: configure systemd-resolved (safe; resolv.conf may stay stub)" \
         "force" "Force-write /etc/resolv.conf (break symlink; requires confirmation)" \
         "cancel" "Cancel" \
-        3>&1 1>&2 2>&3)" || true
+        3>&1 1>&2 2>&3 </dev/tty)" || true
+    else
+      choice="$(choose_apply_method_fallback)"
+    fi
 
-      case "${choice}" in
-        resolved) method="resolved" ;;
-        force)   method="force" ;;
-        *)       wt_msg "Cancelled" "No changes were made."; return 1 ;;
-      esac
-    fi
-  else
-    if [[ "${method}" == "auto" ]]; then
-      method="force"
-    fi
+    case "${choice}" in
+      resolved) method="resolved" ;;
+      force)   method="force" ;;
+      *)       wt_msg "Cancelled" "No changes were made."; return 1 ;;
+    esac
+  elif [[ "${method}" == "auto" ]]; then
+    method="force"
   fi
 
   if ! wt_yesno "Confirm Apply" "Apply DNS '${selected}' using method '${method}'?\n\nNo changes will be made if you choose No."; then
@@ -836,10 +836,24 @@ restore_backup_tui() {
   done
 
   local chosen=""
-  chosen="$(whiptail --title "Restore backup" \
-    --menu "Select a backup to restore:" 20 92 10 \
-    "${opts[@]}" \
-    3>&1 1>&2 2>&3)" || true
+  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
+    chosen="$(whiptail --title "Restore backup" \
+      --menu "Select a backup to restore:" 20 92 10 \
+      "${opts[@]}" \
+      3>&1 1>&2 2>&3)" || true
+  else
+    echo "Available backups:" >/dev/tty
+    local i=0
+    for f in "${backups[@]}"; do
+      i=$((i+1))
+      printf "%2d) %s\n" "${i}" "${f}" >/dev/tty
+    done
+    printf "Enter number [1-%d] (or empty to cancel): " "${i}" >/dev/tty
+    local ans=""
+    read -r ans </dev/tty || true
+    [[ -n "${ans}" && "${ans}" =~ ^[0-9]+$ && ans -ge 1 && ans -le i ]] || return 0
+    chosen="${backups[$((ans-1))]}"
+  fi
 
   [[ -n "${chosen}" ]] || return 0
 
@@ -854,12 +868,28 @@ restore_backup_tui() {
 
   local restore_mode="content"
   if [[ "${is_link}" == "1" && -n "${target_rel}" ]]; then
-    restore_mode="$(whiptail --title "Restore mode" \
-      --menu "This backup was taken when /etc/resolv.conf was a symlink.\nChoose restore behavior:" 16 80 3 \
-      "symlink" "Recreate symlink (/etc/resolv.conf -> ${target_rel}) if possible" \
-      "content" "Restore file content (break symlink; write file)" \
-      "cancel" "Cancel" \
-      3>&1 1>&2 2>&3)" || true
+    if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
+      restore_mode="$(whiptail --title "Restore mode" \
+        --menu "This backup was taken when /etc/resolv.conf was a symlink.\nChoose restore behavior:" 16 80 3 \
+        "symlink" "Recreate symlink (/etc/resolv.conf -> ${target_rel}) if possible" \
+        "content" "Restore file content (break symlink; write file)" \
+        "cancel" "Cancel" \
+        3>&1 1>&2 2>&3)" || true
+    else
+      echo "This backup was taken when /etc/resolv.conf was a symlink." >/dev/tty
+      echo "Choose restore behavior:" >/dev/tty
+      echo "  1) symlink  (/etc/resolv.conf -> ${target_rel})" >/dev/tty
+      echo "  2) content  (write file)" >/dev/tty
+      echo "  0) cancel" >/dev/tty
+      printf "Enter choice [0-2]: " >/dev/tty
+      local ans=""
+      read -r ans </dev/tty || true
+      case "${ans}" in
+        1) restore_mode="symlink" ;;
+        2) restore_mode="content" ;;
+        *) restore_mode="cancel" ;;
+      esac
+    fi
   fi
 
   case "${restore_mode}" in
@@ -880,9 +910,7 @@ restore_backup_tui() {
       cp --preserve=mode,ownership,timestamps "${chosen}" /etc/resolv.conf
       wt_msg "Restored" "Restored content from:\n${chosen}"
       ;;
-    *)
-      return 0
-      ;;
+    *) return 0 ;;
   esac
 
   verify_dns
@@ -895,11 +923,13 @@ apply_dns_cli() {
   local dns="$1"
   local method="${FLAG_METHOD:-auto}"
 
+  if ! is_ipv4 "${dns}" && ! is_ipv6 "${dns}" && [[ -z "${dns}" ]]; then
+    die "--apply value is empty"
+  fi
+
   if (( FLAG_YES != 1 )); then
     if (( INTERACTIVE == 1 )); then
-      if ! wt_yesno "Confirm Apply" "Apply DNS '${dns}' using method '${method}'?"; then
-        die "Cancelled."
-      fi
+      wt_yesno "Confirm Apply" "Apply DNS '${dns}' using method '${method}'?" || die "Cancelled."
     else
       die "Refusing to apply without explicit confirmation. Re-run with --yes."
     fi
@@ -919,9 +949,7 @@ apply_dns_cli() {
     *)       die "Unknown method: ${method} (use resolved|force|auto)" ;;
   esac
 
-  if [[ -L /etc/resolv.conf ]]; then
-    log_info "SYMLINK: /etc/resolv.conf -> $(readlink /etc/resolv.conf)"
-  fi
+  [[ -L /etc/resolv.conf ]] && log_info "SYMLINK: /etc/resolv.conf -> $(readlink /etc/resolv.conf)"
   log_info "Final /etc/resolv.conf:"
   cat /etc/resolv.conf
   if getent hosts google.com >/dev/null 2>&1; then
@@ -945,10 +973,7 @@ ${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (whiptail TUI
 
 Usage:
   sudo bash ${SCRIPT_NAME}
-  bash ${SCRIPT_NAME}               # will auto re-run with sudo if possible
-
-Curl (raw GitHub link):
-  curl -fsSL <raw_url> | sudo bash
+  bash ${SCRIPT_NAME}
 
 Options:
   -h, --help              Show this help
@@ -958,16 +983,7 @@ Options:
   --test                  Run tests and print results (no TUI)
   --apply <dns>           Apply a specific DNS (requires --yes if non-interactive)
   --method <auto|resolved|force>
-                          auto: resolved if systemd-managed; else force
-                          resolved: configure systemd-resolved (safe)
-                          force: write /etc/resolv.conf with only "nameserver <dns>"
   --yes                   Non-interactive confirmation for --apply
-
-Notes:
-- If dns-list.txt is not found next to the script, the list is created at:
-    ${CONFIG_DIR}/dns-list.txt
-- Backups are stored in:
-    ${BACKUP_DIR}/
 EOF
 }
 
@@ -998,12 +1014,11 @@ parse_args() {
 }
 
 # ---------------------------
-# Main menu loop (TUI)
+# Main menu loop
 # ---------------------------
 menu_loop() {
   while true; do
     print_banner
-
     local choice
     choice="$(menu_read_choice)"
 
@@ -1016,15 +1031,11 @@ menu_loop() {
         echo "Press Enter to continue..."
         read -r _ </dev/tty || true
         ;;
-
       2)
         test_dns_list
         clear || true
         cat "${LAST_TABLE_FILE}"
         echo
-
-        # Keep your existing selector (still whiptail-based if available)
-        # If you later want a numbered selector too, tell me and I'll convert it.
         local selected
         selected="$(select_best_dns_tui)"
         if [[ -n "${selected}" ]]; then
@@ -1034,30 +1045,16 @@ menu_loop() {
           read -r _ </dev/tty || true
         fi
         ;;
-
-      3)
-        view_current_dns_config
-        ;;
-
+      3) view_current_dns_config ;;
       4)
         edit_dns_list
         echo
         echo "Press Enter to continue..."
         read -r _ </dev/tty || true
         ;;
-
-      5)
-        restore_backup_tui
-        ;;
-
-      6)
-        show_help_screen
-        ;;
-
-      0|"")
-        break
-        ;;
-
+      5) restore_backup_tui ;;
+      6) show_help_screen ;;
+      0|"") break ;;
       *)
         echo "Invalid choice. Press Enter to continue..."
         read -r _ </dev/tty || true
@@ -1068,19 +1065,18 @@ menu_loop() {
 
 main() {
   INTERACTIVE=0
-  if is_interactive; then
-    INTERACTIVE=1
-  fi
+  is_interactive && INTERACTIVE=1
 
   detect_script_dir
   detect_ubuntu_or_exit
   ensure_root
 
+  # FIX: parse args BEFORE init_list_file so --list actually works
+  parse_args "$@"
+
   init_tmp
   ensure_dirs
   init_list_file
-
-  parse_args "$@"
 
   have_command ping || die "Missing dependency: ping (iputils-ping)"
   have_command getent || die "Missing dependency: getent (libc-bin)"
@@ -1096,8 +1092,6 @@ main() {
   fi
 
   if (( INTERACTIVE == 1 )); then
-    # Main menu is terminal-based now (rathole-style).
-    # whiptail is optional for some sub-screens (textbox/radiolist) but not required.
     ensure_whiptail || true
     menu_loop
   else
