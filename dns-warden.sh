@@ -338,15 +338,29 @@ wt_yesno() {
 }
 
 wt_menu_main() {
+  local prompt
+  prompt=$(
+    cat <<EOF
+DNS Warden — Interactive DNS Benchmark & Switcher
+
+List file: ${LIST_FILE}
+Backups:   ${BACKUP_DIR}
+Ping:      count=${PING_COUNT} timeout=${PING_TIMEOUT}s
+
+Select an action:
+EOF
+  )
+
   local choice=""
-  choice="$(whiptail --title "DNS Warden (Ubuntu) v${APP_VERSION}" \
-    --menu "Select an action:" 18 72 10 \
-    "1" "Test DNS list" \
-    "2" "Select & Apply DNS" \
-    "3" "View current DNS config" \
-    "4" "Edit DNS list" \
-    "5" "Restore backup" \
-    "6" "Exit" \
+  choice="$(whiptail --title "DNS Warden v${APP_VERSION}" \
+    --menu "${prompt}" 20 86 10 \
+    "test"     "Test DNS list (ping + rank)" \
+    "apply"    "Select & Apply DNS (safe / systemd-resolved aware)" \
+    "current"  "View current DNS config (/etc/resolv.conf + resolver status)" \
+    "edit"     "Edit DNS list (${LIST_FILE})" \
+    "restore"  "Restore backup (${BACKUP_DIR})" \
+    "help"     "Usage / non-interactive commands" \
+    "exit"     "Exit" \
     3>&1 1>&2 2>&3 </dev/tty)" || true
 
   printf "%s" "${choice}"
@@ -942,12 +956,14 @@ menu_loop() {
   while true; do
     local choice
     choice="$(wt_menu_main)"
+
     case "${choice}" in
-      1)
+      test)
         test_dns_list
         wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
         ;;
-      2)
+
+      apply)
         test_dns_list
         wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
         local selected
@@ -956,11 +972,51 @@ menu_loop() {
           apply_dns_flow_tui "${selected}"
         fi
         ;;
-      3) view_current_dns_config ;;
-      4) edit_dns_list ;;
-      5) restore_backup_tui ;;
-      6|"") break ;;
-      *) break ;;
+
+      current)
+        view_current_dns_config
+        ;;
+
+      edit)
+        edit_dns_list
+        ;;
+
+      restore)
+        restore_backup_tui
+        ;;
+
+      help)
+        local hf="${TMP_DIR}/help.txt"
+        cat > "${hf}" <<EOF
+DNS Warden v${APP_VERSION}
+
+Interactive:
+  sudo ./dns-warden.sh
+
+Curl:
+  curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/dns-warden.sh | sudo bash
+
+Non-interactive:
+  --test
+    sudo ./dns-warden.sh --test
+
+  --apply <dns> [--method auto|resolved|force] --yes
+    sudo ./dns-warden.sh --apply 1.1.1.1 --method auto --yes
+
+Files:
+  DNS list: ${LIST_FILE}
+  Backups:  ${BACKUP_DIR}
+EOF
+        wt_textbox "Help" "${hf}"
+        ;;
+
+      exit|"")
+        break
+        ;;
+
+      *)
+        break
+        ;;
     esac
   done
 }
