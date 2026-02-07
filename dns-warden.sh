@@ -59,6 +59,7 @@ export LC_ALL=C
 
 VERSION="1.0.0"
 SCRIPT_NAME="dns-warden.sh"
+APP_VERSION="${VERSION}"
 
 # Defaults (overridable by flags)
 PING_COUNT_DEFAULT=3
