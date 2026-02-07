@@ -365,22 +365,25 @@ print_banner() {
 
 menu_read_choice() {
   local choice=""
-  printf "1. Test DNS list (ping + rank)\n"
-  printf "2. Select & Apply DNS\n"
-  printf "3. View current DNS config\n"
-  printf "4. Edit DNS list\n"
-  printf "5. Restore backup\n"
-  printf "6. Help\n"
-  printf "0. Exit\n"
-  echo
-  printf "Enter your choice [0-6]: "
 
-  # Read from /dev/tty so it works even in curl|bash
+  {
+    printf "1. Test DNS list (ping + rank)\n"
+    printf "2. Select & Apply DNS\n"
+    printf "3. View current DNS config\n"
+    printf "4. Edit DNS list\n"
+    printf "5. Restore backup\n"
+    printf "6. Help\n"
+    printf "0. Exit\n"
+    printf "\n"
+    printf "Enter your choice [0-6]: "
+  } >/dev/tty
+
   if ! read -r choice </dev/tty; then
     printf ""
     return 0
   fi
 
+  # فقط انتخاب روی stdout برگرده تا command-substitution کار کنه
   printf "%s" "${choice}"
 }
 
