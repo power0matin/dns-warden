@@ -480,7 +480,7 @@ ping_one() {
   rc=$?
 
   local loss avg score
-  loss="$(grep -oE '[0-9]+(?=% packet loss)' <<< "${out}" | head -n1 || true)"
+  loss="$(awk '/packet loss/ {for (i=1;i<=NF;i++) if ($i ~ /%/) {gsub(/%/,"",$i); print $i; exit}}' <<< "${out}" || true)"
   if [[ -z "${loss}" ]]; then
     loss="100"
   fi
