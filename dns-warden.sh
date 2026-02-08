@@ -3,9 +3,9 @@
 # Safe for: Ubuntu 20.04+
 # No external deps beyond core utils; uses less/nano if present.
 
-# ---------------------------
+###############################################################################
 # Loader: sudo re-exec support
-# ---------------------------
+###############################################################################
 if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   export DNS_WARDEN_LAUNCHED=1
 
@@ -39,12 +39,15 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   fi
 fi
 
+###############################################################################
+# Strict mode
+###############################################################################
 set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.2.0"
-SCRIPT_NAME="dns-warden.sh"
+VERSION="1.2.1"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-dns-warden.sh}")"
 APP_VERSION="${VERSION}"
 
 PING_COUNT_DEFAULT=3
@@ -67,9 +70,9 @@ FLAG_METHOD=""     # auto|resolved|force
 FLAG_YES=0
 FLAG_LIST_OVERRIDE=""
 
-# ---------------------------
+###############################################################################
 # Colors (Rathole_v2-like)
-# ---------------------------
+###############################################################################
 is_tty() { [[ -t 1 ]]; }
 
 c_reset() { is_tty && printf "\033[0m" || true; }
@@ -82,27 +85,27 @@ c_blue()  { is_tty && printf "\033[34m" || true; }
 c_cyan()  { is_tty && printf "\033[36m" || true; }
 c_mag()   { is_tty && printf "\033[35m" || true; }
 
-# ---------------------------
+###############################################################################
 # Logging
-# ---------------------------
-log_info()  { printf "%s[INFO]%s %s\n"  "$(c_cyan)" "$(c_reset)" "$*"; }
+###############################################################################
+log_info()  { printf "%s[INFO]%s %s\n"  "$(c_cyan)"  "$(c_reset)" "$*"; }
 log_warn()  { printf "%s[WARN]%s %s\n"  "$(c_yellow)" "$(c_reset)" "$*"; }
-log_error() { printf "%s[ERR ]%s %s\n"  "$(c_red)" "$(c_reset)" "$*"; }
+log_error() { printf "%s[ERR ]%s %s\n"  "$(c_red)"  "$(c_reset)" "$*"; }
 die()       { log_error "$*"; exit 1; }
 
-# ---------------------------
+###############################################################################
 # Cleanup
-# ---------------------------
+###############################################################################
 cleanup() {
   if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
     rm -rf "${TMP_DIR}"
   fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
-# ---------------------------
+###############################################################################
 # Helpers
-# ---------------------------
+###############################################################################
 have_command() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_dirs() {
@@ -121,7 +124,8 @@ detect_script_dir() {
 detect_ubuntu_or_exit() {
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release. This script requires Ubuntu 20.04+."
   local os_id os_ver
-  mapfile -t _os < <(. /etc/os-release && printf '%s\n%s\n' "${ID:-}" "${VERSION_ID:-}")
+  # source only in a subshell to avoid polluting environment
+  mapfile -t _os < <( ( . /etc/os-release >/dev/null 2>&1; printf '%s\n%s\n' "${ID:-}" "${VERSION_ID:-}" ) )
   os_id="${_os[0]:-}"
   os_ver="${_os[1]:-0}"
 
@@ -152,8 +156,10 @@ init_tmp() {
 }
 
 trim() {
-  local s="$1"
-  s="$(echo "${s}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  local s="${1:-}"
+  # avoid useless subshell for empty string
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
   printf "%s" "${s}"
 }
 
@@ -171,8 +177,8 @@ is_ipv4() {
 
 is_ipv6() {
   local ip="$1"
-  [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
   [[ "${ip}" == *:* ]] || return 1
+  [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
   return 0
 }
 
@@ -180,11 +186,11 @@ resolve_prefer_v4_then_v6() {
   local host="$1"
   local ip=""
   if getent ahostsv4 "${host}" >/dev/null 2>&1; then
-    ip="$(getent ahostsv4 "${host}" | awk '{print $1; exit}')"
+    ip="$(getent ahostsv4 "${host}" | awk 'NR==1 {print $1}')"
     [[ -n "${ip}" ]] && { printf "4 %s" "${ip}"; return 0; }
   fi
   if getent ahostsv6 "${host}" >/dev/null 2>&1; then
-    ip="$(getent ahostsv6 "${host}" | awk '{print $1; exit}')"
+    ip="$(getent ahostsv6 "${host}" | awk 'NR==1 {print $1}')"
     [[ -n "${ip}" ]] && { printf "6 %s" "${ip}"; return 0; }
   fi
   return 1
@@ -240,9 +246,9 @@ EOF
   fi
 }
 
-# ---------------------------
+###############################################################################
 # DNS list parsing
-# ---------------------------
+###############################################################################
 read_dns_list() {
   local file="$1"
   [[ -r "${file}" ]] || die "DNS list file not readable: ${file}"
@@ -260,9 +266,10 @@ read_dns_list() {
   printf "%s\n" "${entries[@]}"
 }
 
-# ---------------------------
-# Ping testing
-# ---------------------------
+###############################################################################
+# Ping testing (optimized)
+###############################################################################
+# NOTE: ping output parsing assumes iputils ping format on Ubuntu [web:8]
 ping_one() {
   local endpoint="$1"
 
@@ -275,45 +282,55 @@ ping_one() {
     family="6"; ip_for_ping="${endpoint}"
   else
     if resolved="$(resolve_prefer_v4_then_v6 "${endpoint}" 2>/dev/null)"; then
-      family="$(awk '{print $1}' <<< "${resolved}")"
-      ip="$(awk '{print $2}' <<< "${resolved}")"
+      family="${resolved%% *}"
+      ip="${resolved#* }"
       ip_for_ping="${ip}"
     else
-      family="?"; ip_for_ping="${endpoint}"
+      family="4"
+      ip_for_ping="${endpoint}"
     fi
   fi
 
-  local ping_cmd="" ping_args=()
+  local ping_cmd="ping" ping_args=()
   if [[ "${family}" == "6" ]]; then
     if have_command ping6; then
-      ping_cmd="ping6"; ping_args=(-c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+      ping_cmd="ping6"
+      ping_args=(-c "${PING_COUNT}" -W "${PING_TIMEOUT}")
     else
-      ping_cmd="ping"; ping_args=(-6 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+      ping_args=(-6 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
     fi
   else
-    ping_cmd="ping"; ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+    ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
   fi
 
-  local out rc=0
+  local out rc
   set +e
   out="$("${ping_cmd}" "${ping_args[@]}" "${ip_for_ping}" 2>&1)"
   rc=$?
   set -e
 
-  local loss avg score
-  loss="$(awk '/packet loss/ {for (i=1;i<=NF;i++) if ($i ~ /%/) {gsub(/%/,"",$i); print $i; exit}}' <<< "${out}" || true)"
-  [[ -n "${loss}" ]] || loss="100"
+  local loss="100" avg="9999"
+  local line
+  while IFS= read -r line; do
+    case "${line}" in
+      *"packet loss"*)
+        loss="${line##* }"
+        loss="${loss%%%*}"
+        [[ -z "${loss}" ]] && loss="100"
+        ;;
+      *"rtt min/avg/max/mdev"*|*"round-trip min/avg/max/stddev"*)
+        line="${line#*=}"
+        line="$(trim "${line}")"
+        avg="${line#*/}"
+        avg="${avg%%/*}"
+        ;;
+    esac
+  done <<< "${out}"
 
-  avg="$(awk '
-    /rtt min\/avg\/max\/mdev/ || /round-trip min\/avg\/max\/stddev/ {
-      split($0, a, "=")
-      gsub(/^[[:space:]]+/, "", a[2])
-      split(a[2], b, "/")
-      print b[2]
-      exit
-    }' <<< "${out}" || true)"
-  [[ -n "${avg}" ]] || avg="9999"
+  if [[ -z "${avg}" ]]; then avg="9999"; fi
+  if [[ -z "${loss}" ]]; then loss="100"; fi
 
+  local score
   score="$(awk -v a="${avg}" -v l="${loss}" 'BEGIN{printf "%.3f", a + (l*1000)}')"
   printf "%s|%s|%s|%s|%s\n" "${display}" "${family}" "${loss}" "${avg}" "${score}"
   return "${rc}"
@@ -353,7 +370,6 @@ test_dns_list() {
 
   : > "${LAST_RESULTS_FILE}"
 
-  # UX: minimal progress indicator
   local total="${#entries[@]}"
   local i=0 e
   for e in "${entries[@]}"; do
@@ -368,9 +384,9 @@ test_dns_list() {
   build_results_table
 }
 
-# ---------------------------
+###############################################################################
 # DNS apply logic
-# ---------------------------
+###############################################################################
 resolv_conf_is_symlink() { [[ -L /etc/resolv.conf ]]; }
 
 resolv_conf_symlink_managed_by_systemd() {
@@ -387,6 +403,8 @@ systemd_resolved_active() {
 
 backup_resolv_conf() {
   ensure_dirs
+  [[ -e /etc/resolv.conf ]] || die "/etc/resolv.conf not found to backup."
+
   local ts backup meta
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="${BACKUP_DIR}/resolv.conf.${ts}"
@@ -413,14 +431,13 @@ backup_resolv_conf() {
 }
 
 confirm() {
-  # confirm "question"
   local q="$1"
   if (( FLAG_YES == 1 )); then
     return 0
   fi
   printf "%s%s%s [y/N]: " "$(c_yellow)" "${q}" "$(c_reset)"
   local ans=""
-  read -r ans
+  read -r ans || true
   [[ "${ans}" =~ ^[Yy]$ ]]
 }
 
@@ -502,11 +519,11 @@ verify_dns() {
       echo "SYMLINK: /etc/resolv.conf -> $(readlink /etc/resolv.conf)"
       echo "REALPATH: $(readlink -f /etc/resolv.conf || true)"
     fi
-    cat /etc/resolv.conf || true
+    cat /etc/resolv.conf 2>/dev/null || true
     echo
     if have_command resolvectl; then
       echo "--- resolvectl status (summary) ---"
-      resolvectl status 2>/dev/null | head -n 120 || true
+      resolvectl status 2>/dev/null | head -n 80 || true
       echo
       echo "--- resolvectl query google.com ---"
       resolvectl query google.com 2>/dev/null || true
@@ -543,9 +560,9 @@ apply_dns_auto() {
   esac
 }
 
-# ---------------------------
+###############################################################################
 # Backups restore
-# ---------------------------
+###############################################################################
 list_backups() { ls -1 "${BACKUP_DIR}"/resolv.conf.* 2>/dev/null | grep -v '\.meta$' || true; }
 
 meta_get() {
@@ -569,7 +586,7 @@ restore_backup_cli() {
   echo
 
   local pick=""
-  read -r -p "Select backup number (or Enter to cancel): " pick
+  read -r -p "Select backup number (or Enter to cancel): " pick || true
   pick="$(trim "${pick}")"
   [[ -z "${pick}" ]] && return 0
   [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Invalid input."; return 0; }
@@ -590,7 +607,7 @@ restore_backup_cli() {
     echo "  2) Restore file content (write file; breaks symlink)"
     echo
     local mode=""
-    read -r -p "Choose [1-2] (Enter=cancel): " mode
+    read -r -p "Choose [1-2] (Enter=cancel): " mode || true
     mode="$(trim "${mode}")"
     [[ -z "${mode}" ]] && return 0
     if [[ "${mode}" == "1" ]]; then
@@ -617,9 +634,9 @@ restore_backup_cli() {
   verify_dns
 }
 
-# ---------------------------
+###############################################################################
 # Pager / UI
-# ---------------------------
+###############################################################################
 pager_file() {
   local f="$1"
   if have_command less; then
@@ -655,7 +672,6 @@ dns_management_status() {
 }
 
 current_nameserver_summary() {
-  # show first nameserver line
   awk '/^nameserver[[:space:]]+/ {print $2; exit}' /etc/resolv.conf 2>/dev/null || true
 }
 
@@ -695,9 +711,9 @@ pause_any() {
   fi
 }
 
-# ---------------------------
-# UX: Select DNS from ranked results (no whiptail)
-# ---------------------------
+###############################################################################
+# UX: Select DNS from ranked results
+###############################################################################
 select_dns_from_results() {
   [[ -s "${LAST_RESULTS_FILE}" ]] || test_dns_list
 
@@ -711,16 +727,19 @@ select_dns_from_results() {
   local i=0 endpoint family loss avg score
   while IFS='|' read -r endpoint family loss avg score; do
     i=$((i+1))
-    # Color hint: low loss/low avg => greener
     local col=""
-    if [[ "${loss}" =~ ^[0-9]+$ ]] && (( loss == 0 )); then col="$(c_green)"; else col="$(c_yellow)"; fi
+    if [[ "${loss}" =~ ^[0-9]+$ ]] && (( loss == 0 )); then
+      col="$(c_green)"
+    else
+      col="$(c_yellow)"
+    fi
     printf "  %s%2d)%s %-42s  loss=%-3s%% avg=%-6sms score=%s\n" "${col}" "${i}" "$(c_reset)" "${endpoint}" "${loss}" "${avg}" "${score}"
     (( i >= 25 )) && break
   done < "${sorted}"
 
   echo
   local pick=""
-  read -r -p "Select DNS number (Enter=cancel): " pick
+  read -r -p "Select DNS number (Enter=cancel): " pick || true
   pick="$(trim "${pick}")"
   [[ -z "${pick}" ]] && { printf ""; return 0; }
   [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Invalid number."; printf ""; return 0; }
@@ -731,9 +750,9 @@ select_dns_from_results() {
   printf "%s" "${selected}"
 }
 
-# ---------------------------
+###############################################################################
 # Flows
-# ---------------------------
+###############################################################################
 view_current_dns_config() {
   local out="${TMP_DIR}/current.txt"
   {
@@ -752,14 +771,14 @@ view_current_dns_config() {
     fi
     echo
     echo "--- /etc/resolv.conf content ---"
-    cat /etc/resolv.conf || true
+    cat /etc/resolv.conf 2>/dev/null || true
     echo
     if have_command resolvectl; then
       echo "--- resolvectl status (summary) ---"
-      resolvectl status 2>/dev/null | head -n 120 || true
+      resolvectl status 2>/dev/null | head -n 80 || true
     elif have_command systemd-resolve; then
       echo "--- systemd-resolve --status (summary) ---"
-      systemd-resolve --status 2>/dev/null | head -n 120 || true
+      systemd-resolve --status 2>/dev/null | head -n 80 || true
     else
       echo "No resolvectl/systemd-resolve available."
     fi
@@ -782,8 +801,8 @@ edit_dns_list() {
 
 show_help_screen() {
   local out="${TMP_DIR}/help.txt"
-  : > "${out}"
-  cat >> "${out}" <<EOF
+  {
+    cat <<EOF
 DNS Warden v${APP_VERSION}
 
 Usage (Interactive):
@@ -807,15 +826,15 @@ Notes:
   - If /etc/resolv.conf is managed by systemd-resolved, 'resolved' method is safest.
   - Force method can break the /etc/resolv.conf symlink.
 EOF
+  } > "${out}"
   pager_file "${out}"
 }
 
-# ---------------------------
+###############################################################################
 # CLI apply/test flows
-# ---------------------------
+###############################################################################
 apply_dns_cli() {
   local dns="$1"
-  local method="${FLAG_METHOD:-auto}"
   dns="$(trim "${dns}")"
   [[ -n "${dns}" ]] || die "--apply value is empty"
 
@@ -840,9 +859,9 @@ test_dns_cli() {
   cat "${LAST_TABLE_FILE}"
 }
 
-# ---------------------------
+###############################################################################
 # Args / help
-# ---------------------------
+###############################################################################
 usage() {
   cat <<EOF
 ${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (Rathole_v2-style TUI)
@@ -891,9 +910,9 @@ parse_args() {
   fi
 }
 
-# ---------------------------
-# Main Menu (Rathole_v2-style)
-# ---------------------------
+###############################################################################
+# Main Menu
+###############################################################################
 menu_loop() {
   while true; do
     print_banner
@@ -928,7 +947,6 @@ menu_loop() {
           continue
         fi
 
-        # UX: auto-detect method + show confirmation
         local method="auto"
         [[ -n "${FLAG_METHOD}" ]] && method="${FLAG_METHOD}"
         if [[ "${method}" == "auto" ]]; then
@@ -972,6 +990,9 @@ menu_loop() {
   done
 }
 
+###############################################################################
+# main
+###############################################################################
 main() {
   detect_script_dir
   detect_ubuntu_or_exit
@@ -996,7 +1017,6 @@ main() {
     return 0
   fi
 
-  # Interactive menu (terminal)
   if [[ -t 0 && -t 1 ]]; then
     menu_loop
   else
