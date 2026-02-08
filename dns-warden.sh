@@ -331,7 +331,7 @@ build_results_table() {
     printf "Ping:      count=%s timeout=%ss\n" "${PING_COUNT}" "${PING_TIMEOUT}"
     printf "\n"
     printf "Results (sorted by score; lower is better)\n"
-    printf "------------------------------------------------------------\n"
+    printf -- "------------------------------------------------------------\n"
     printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "Rank" "DNS" "Loss%" "Avg(ms)" "Score"
     printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "----" "------------------------------------------" "------" "-------" "----------"
 
@@ -342,8 +342,8 @@ build_results_table() {
     done < "${sorted}"
 
     printf "\nNotes:\n"
-    printf "- Hostnames are resolved (prefer IPv4; fallback IPv6).\n"
-    printf "- Loss is heavily penalized in score (loss*1000).\n"
+    printf -- "- Hostnames are resolved (prefer IPv4; fallback IPv6).\n"
+    printf -- "- Loss is heavily penalized in score (loss*1000).\n"
   } > "${LAST_TABLE_FILE}"
 }
 
