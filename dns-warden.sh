@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# DNS Warden - Ubuntu-only DNS tester & switcher (TUI via whiptail)
+# DNS Warden - Ubuntu-only DNS tester & switcher (Rathole_v2-style TUI)
 # Safe for: Ubuntu 20.04+
-# Shellcheck-friendly. No external dependencies beyond core utilities + whiptail/newt.
-#
-# Key UX goal: ALL menus/dialogs in whiptail when interactive.
+# No external deps beyond core utils; uses less/nano if present.
 
 # ---------------------------
 # Loader: sudo re-exec support
@@ -15,7 +13,6 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   _script_path="${BASH_SOURCE[0]:-}"
 
   if [[ -z "${_script_path}" || ! -r "${_script_path}" ]]; then
-    # Script executed from stdin (e.g., curl | bash), or source path not readable.
     _tmp="$(mktemp -t dns-warden.XXXXXX)"
     cat > "${_tmp}"
     chmod 0700 "${_tmp}"
@@ -25,7 +22,6 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
         exec sudo -E bash "${_tmp}" "$@"
       else
         echo "ERROR: This script must run as root, and 'sudo' is not available." >&2
-        echo "Re-run as root, e.g.: curl -fsSL <raw_url> | sudo bash" >&2
         exit 1
       fi
     else
@@ -43,20 +39,16 @@ if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   fi
 fi
 
-# ---------------------------
-# Main script starts here
-# ---------------------------
 set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_NAME="dns-warden.sh"
 APP_VERSION="${VERSION}"
 
 PING_COUNT_DEFAULT=3
 PING_TIMEOUT_DEFAULT=2
-
 PING_COUNT="${PING_COUNT_DEFAULT}"
 PING_TIMEOUT="${PING_TIMEOUT_DEFAULT}"
 
@@ -64,9 +56,6 @@ SCRIPT_DIR=""
 CONFIG_DIR="/etc/dns-warden"
 BACKUP_DIR="/var/backups/dns-warden"
 LIST_FILE=""
-
-INTERACTIVE=0
-HAVE_WHIPTAIL=0
 
 TMP_DIR=""
 LAST_RESULTS_FILE=""
@@ -79,17 +68,26 @@ FLAG_YES=0
 FLAG_LIST_OVERRIDE=""
 
 # ---------------------------
+# Colors (Rathole_v2-like)
+# ---------------------------
+is_tty() { [[ -t 1 ]]; }
+
+c_reset() { is_tty && printf "\033[0m" || true; }
+c_dim()   { is_tty && printf "\033[2m" || true; }
+c_bold()  { is_tty && printf "\033[1m" || true; }
+c_red()   { is_tty && printf "\033[31m" || true; }
+c_green() { is_tty && printf "\033[32m" || true; }
+c_yellow(){ is_tty && printf "\033[33m" || true; }
+c_blue()  { is_tty && printf "\033[34m" || true; }
+c_cyan()  { is_tty && printf "\033[36m" || true; }
+c_mag()   { is_tty && printf "\033[35m" || true; }
+
+# ---------------------------
 # Logging
 # ---------------------------
-_color() {
-  local code="$1"
-  if [[ -t 1 ]]; then
-    printf "\033[%sm" "${code}"
-  fi
-}
-log_info()  { printf "%s[INFO]%s %s\n"  "$(_color 36)" "$(_color 0)" "$*"; }
-log_warn()  { printf "%s[WARN]%s %s\n"  "$(_color 33)" "$(_color 0)" "$*"; }
-log_error() { printf "%s[ERR ]%s %s\n"  "$(_color 31)" "$(_color 0)" "$*"; }
+log_info()  { printf "%s[INFO]%s %s\n"  "$(c_cyan)" "$(c_reset)" "$*"; }
+log_warn()  { printf "%s[WARN]%s %s\n"  "$(c_yellow)" "$(c_reset)" "$*"; }
+log_error() { printf "%s[ERR ]%s %s\n"  "$(c_red)" "$(c_reset)" "$*"; }
 die()       { log_error "$*"; exit 1; }
 
 # ---------------------------
@@ -105,10 +103,6 @@ trap cleanup EXIT
 # ---------------------------
 # Helpers
 # ---------------------------
-is_interactive() {
-  [[ -t 1 && -r /dev/tty && -w /dev/tty ]]
-}
-
 have_command() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_dirs() {
@@ -126,7 +120,6 @@ detect_script_dir() {
 
 detect_ubuntu_or_exit() {
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release. This script requires Ubuntu 20.04+."
-
   local os_id os_ver
   mapfile -t _os < <(. /etc/os-release && printf '%s\n%s\n' "${ID:-}" "${VERSION_ID:-}")
   os_id="${_os[0]:-}"
@@ -139,9 +132,7 @@ detect_ubuntu_or_exit() {
   local ver="${os_ver}"
   local major="${ver%%.*}"
   if [[ "${major}" =~ ^[0-9]+$ ]]; then
-    if (( major < 20 )); then
-      die "Unsupported Ubuntu version: ${ver}. Require Ubuntu 20.04+."
-    fi
+    (( major >= 20 )) || die "Unsupported Ubuntu version: ${ver}. Require Ubuntu 20.04+."
   else
     die "Could not parse Ubuntu version (VERSION_ID='${ver}')."
   fi
@@ -153,129 +144,13 @@ ensure_root() {
   fi
 }
 
-# ---------------------------
-# whiptail helpers (UX-centric)
-# ---------------------------
-WT_BACKTITLE="DNS Warden • Ubuntu DNS Tester & Switcher"
-
-ensure_whiptail() {
-  if command -v whiptail >/dev/null 2>&1; then
-    HAVE_WHIPTAIL=1
-    return 0
-  fi
-
-  HAVE_WHIPTAIL=0
-
-  # Only attempt install in interactive mode
-  if (( INTERACTIVE == 1 )); then
-    log_warn "whiptail not found. Attempting to install..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || true
-    # Ubuntu: whiptail package exists; newt also provides whiptail in many cases.
-    apt-get install -y whiptail >/dev/null 2>&1 \
-      || apt-get install -y newt >/dev/null 2>&1 \
-      || true
-  fi
-
-  if command -v whiptail >/dev/null 2>&1; then
-    HAVE_WHIPTAIL=1
-  else
-    HAVE_WHIPTAIL=0
-  fi
+init_tmp() {
+  TMP_DIR="$(mktemp -d -t dns-warden-tmp.XXXXXX)"
+  chmod 0700 "${TMP_DIR}"
+  LAST_RESULTS_FILE="${TMP_DIR}/results.raw"
+  LAST_TABLE_FILE="${TMP_DIR}/results.table.txt"
 }
 
-wt_msg() {
-  local title="$1"; shift
-  local text="${1:-}"
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --msgbox "${text}" 12 78 </dev/tty
-  else
-    log_info "${title}: ${text}"
-  fi
-}
-
-wt_textbox() {
-  local title="$1"
-  local file="$2"
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --scrolltext --textbox "${file}" 26 100 </dev/tty
-  else
-    cat "${file}"
-  fi
-}
-
-wt_yesno() {
-  local title="$1"
-  local text="$2"
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --yesno "${text}" 12 78 </dev/tty
-    return $?
-  fi
-
-  if (( FLAG_YES == 1 )); then
-    return 0
-  fi
-
-  if [[ -t 0 ]]; then
-    printf "%s [y/N]: " "${text}"
-    local ans=""
-    read -r ans
-    [[ "${ans}" =~ ^[Yy]$ ]]
-  else
-    return 1
-  fi
-}
-
-wt_menu() {
-  # Usage: wt_menu "Title" "Text" height width menuheight  "tag1" "item1" "tag2" "item2" ...
-  local title="$1"; shift
-  local text="$1"; shift
-  local h="$1"; shift
-  local w="$1"; shift
-  local mh="$1"; shift
-
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --menu "${text}" "${h}" "${w}" "${mh}" "$@" \
-      3>&1 1>&2 2>&3 </dev/tty
-  else
-    printf ""
-    return 0
-  fi
-}
-
-wt_radiolist() {
-  # Usage: wt_radiolist "Title" "Text" h w mh  tag item status ...
-  local title="$1"; shift
-  local text="$1"; shift
-  local h="$1"; shift
-  local w="$1"; shift
-  local mh="$1"; shift
-
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --radiolist "${text}" "${h}" "${w}" "${mh}" "$@" \
-      3>&1 1>&2 2>&3 </dev/tty
-  else
-    printf ""
-    return 0
-  fi
-}
-
-wt_inputbox() {
-  local title="$1"
-  local text="$2"
-  local init="${3:-}"
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    whiptail --backtitle "${WT_BACKTITLE}" --title "${title}" --inputbox "${text}" 12 78 "${init}" \
-      3>&1 1>&2 2>&3 </dev/tty
-  else
-    printf ""
-    return 0
-  fi
-}
-
-# ---------------------------
-# Text helpers
-# ---------------------------
 trim() {
   local s="$1"
   s="$(echo "${s}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -294,7 +169,6 @@ is_ipv4() {
   return 0
 }
 
-# Not a perfect IPv6 validator, but less dumb than "*:*"
 is_ipv6() {
   local ip="$1"
   [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
@@ -307,26 +181,13 @@ resolve_prefer_v4_then_v6() {
   local ip=""
   if getent ahostsv4 "${host}" >/dev/null 2>&1; then
     ip="$(getent ahostsv4 "${host}" | awk '{print $1; exit}')"
-    if [[ -n "${ip}" ]]; then
-      printf "4 %s" "${ip}"
-      return 0
-    fi
+    [[ -n "${ip}" ]] && { printf "4 %s" "${ip}"; return 0; }
   fi
   if getent ahostsv6 "${host}" >/dev/null 2>&1; then
     ip="$(getent ahostsv6 "${host}" | awk '{print $1; exit}')"
-    if [[ -n "${ip}" ]]; then
-      printf "6 %s" "${ip}"
-      return 0
-    fi
+    [[ -n "${ip}" ]] && { printf "6 %s" "${ip}"; return 0; }
   fi
   return 1
-}
-
-init_tmp() {
-  TMP_DIR="$(mktemp -d -t dns-warden-tmp.XXXXXX)"
-  chmod 0700 "${TMP_DIR}"
-  LAST_RESULTS_FILE="${TMP_DIR}/results.raw"
-  LAST_TABLE_FILE="${TMP_DIR}/results.table.txt"
 }
 
 init_list_file() {
@@ -371,59 +232,12 @@ init_list_file() {
 2620:119:35::35
 2620:119:53::53
 
-# Optional hostname examples
+# Hostname examples
 # one.one.one.one
 # dns.google
 EOF
     chmod 0644 "${LIST_FILE}"
   fi
-}
-
-# ---------------------------
-# UI banner info (for tables / help text)
-# ---------------------------
-banner_info() {
-  {
-    echo "DNS Warden v${APP_VERSION}"
-    echo "List file: ${LIST_FILE}"
-    echo "Backups:   ${BACKUP_DIR}"
-    echo "Ping:      count=${PING_COUNT} timeout=${PING_TIMEOUT}s"
-    if [[ -L /etc/resolv.conf ]]; then
-      echo "resolv.conf: symlink -> $(readlink /etc/resolv.conf || true)"
-    else
-      echo "resolv.conf: regular file"
-    fi
-    echo
-  } >> "${1:?}"
-}
-
-show_help_screen() {
-  local out="${TMP_DIR}/help.txt"
-  : > "${out}"
-  banner_info "${out}"
-  cat >> "${out}" <<EOF
-Usage (Interactive):
-  sudo ./${SCRIPT_NAME}
-
-Curl:
-  curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/dns-warden.sh | sudo bash
-
-Non-interactive:
-  --test
-    sudo ./${SCRIPT_NAME} --test
-
-  --apply <dns> [--method auto|resolved|force] --yes
-    sudo ./${SCRIPT_NAME} --apply 1.1.1.1 --method auto --yes
-
-Files:
-  DNS list: ${LIST_FILE}
-  Backups:  ${BACKUP_DIR}
-
-Notes:
-  - If /etc/resolv.conf is managed by systemd-resolved, the 'resolved' method is safest.
-  - Force method can break the /etc/resolv.conf symlink.
-EOF
-  wt_textbox "Help" "${out}"
 }
 
 # ---------------------------
@@ -456,34 +270,28 @@ ping_one() {
   local resolved="" ip=""
 
   if is_ipv4 "${endpoint}"; then
-    family="4"
-    ip_for_ping="${endpoint}"
+    family="4"; ip_for_ping="${endpoint}"
   elif is_ipv6 "${endpoint}"; then
-    family="6"
-    ip_for_ping="${endpoint}"
+    family="6"; ip_for_ping="${endpoint}"
   else
     if resolved="$(resolve_prefer_v4_then_v6 "${endpoint}" 2>/dev/null)"; then
       family="$(awk '{print $1}' <<< "${resolved}")"
       ip="$(awk '{print $2}' <<< "${resolved}")"
       ip_for_ping="${ip}"
     else
-      family="?"
-      ip_for_ping="${endpoint}"
+      family="?"; ip_for_ping="${endpoint}"
     fi
   fi
 
   local ping_cmd="" ping_args=()
   if [[ "${family}" == "6" ]]; then
     if have_command ping6; then
-      ping_cmd="ping6"
-      ping_args=(-c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+      ping_cmd="ping6"; ping_args=(-c "${PING_COUNT}" -W "${PING_TIMEOUT}")
     else
-      ping_cmd="ping"
-      ping_args=(-6 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+      ping_cmd="ping"; ping_args=(-6 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
     fi
   else
-    ping_cmd="ping"
-    ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
+    ping_cmd="ping"; ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
   fi
 
   local out rc=0
@@ -506,40 +314,28 @@ ping_one() {
     }' <<< "${out}" || true)"
   [[ -n "${avg}" ]] || avg="9999"
 
-  # Penalize packet loss heavily: loss% * 1000ms
   score="$(awk -v a="${avg}" -v l="${loss}" 'BEGIN{printf "%.3f", a + (l*1000)}')"
-
   printf "%s|%s|%s|%s|%s\n" "${display}" "${family}" "${loss}" "${avg}" "${score}"
   return "${rc}"
 }
 
-test_dns_list() {
-  local -a entries=()
-  mapfile -t entries < <(read_dns_list "${LIST_FILE}")
-
-  : > "${LAST_RESULTS_FILE}"
-  local e
-  for e in "${entries[@]}"; do
-    ping_one "${e}" >> "${LAST_RESULTS_FILE}" || true
-  done
-  build_results_table
-}
-
 build_results_table() {
   [[ -s "${LAST_RESULTS_FILE}" ]] || die "No results to display."
-
   local sorted="${TMP_DIR}/results.sorted"
   sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
 
   {
-    banner_info /dev/stdout
+    printf "DNS Warden v%s\n" "${APP_VERSION}"
+    printf "List file: %s\n" "${LIST_FILE}"
+    printf "Backups:   %s\n" "${BACKUP_DIR}"
+    printf "Ping:      count=%s timeout=%ss\n" "${PING_COUNT}" "${PING_TIMEOUT}"
+    printf "\n"
     printf "Results (sorted by score; lower is better)\n"
     printf "------------------------------------------------------------\n"
     printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "Rank" "DNS" "Loss%" "Avg(ms)" "Score"
     printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "----" "------------------------------------------" "------" "-------" "----------"
 
-    local rank=0
-    local endpoint family loss avg score
+    local rank=0 endpoint family loss avg score
     while IFS='|' read -r endpoint family loss avg score; do
       rank=$((rank + 1))
       printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "${rank}" "${endpoint}" "${loss}" "${avg}" "${score}"
@@ -551,32 +347,25 @@ build_results_table() {
   } > "${LAST_TABLE_FILE}"
 }
 
-select_best_dns_tui() {
-  [[ -s "${LAST_RESULTS_FILE}" ]] || test_dns_list
+test_dns_list() {
+  local -a entries=()
+  mapfile -t entries < <(read_dns_list "${LIST_FILE}")
 
-  if (( HAVE_WHIPTAIL != 1 || INTERACTIVE != 1 )); then
-    printf ""
-    return 0
-  fi
+  : > "${LAST_RESULTS_FILE}"
 
-  local sorted="${TMP_DIR}/results.sorted"
-  sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
-
-  local -a opts=()
-  local first=1
-  local endpoint family loss avg score desc status
-
-  while IFS='|' read -r endpoint family loss avg score; do
-    desc="loss=${loss}%, avg=${avg}ms, score=${score}"
-    status="OFF"
-    if (( first == 1 )); then
-      status="ON"
-      first=0
+  # UX: minimal progress indicator
+  local total="${#entries[@]}"
+  local i=0 e
+  for e in "${entries[@]}"; do
+    i=$((i+1))
+    if is_tty; then
+      printf "\r%sTesting DNS...%s %s/%s  " "$(c_cyan)" "$(c_reset)" "${i}" "${total}"
     fi
-    opts+=("${endpoint}" "${desc}" "${status}")
-  done < "${sorted}"
+    ping_one "${e}" >> "${LAST_RESULTS_FILE}" || true
+  done
+  if is_tty; then printf "\r%sTesting DNS...%s done.           \n" "$(c_green)" "$(c_reset)"; fi
 
-  wt_radiolist "Select DNS to apply" "Choose one DNS endpoint:" 22 100 12 "${opts[@]}" || true
+  build_results_table
 }
 
 # ---------------------------
@@ -598,10 +387,10 @@ systemd_resolved_active() {
 
 backup_resolv_conf() {
   ensure_dirs
-  local ts
+  local ts backup meta
   ts="$(date +%Y%m%d-%H%M%S)"
-  local backup="${BACKUP_DIR}/resolv.conf.${ts}"
-  local meta="${backup}.meta"
+  backup="${BACKUP_DIR}/resolv.conf.${ts}"
+  meta="${backup}.meta"
 
   local is_link=0 target_rel="" target_abs=""
   if [[ -L /etc/resolv.conf ]]; then
@@ -620,8 +409,19 @@ backup_resolv_conf() {
     printf "SYMLINK_TARGET_ABS=%s\n" "${target_abs}"
   } > "${meta}"
   chmod 0600 "${meta}"
-
   printf "%s" "${backup}"
+}
+
+confirm() {
+  # confirm "question"
+  local q="$1"
+  if (( FLAG_YES == 1 )); then
+    return 0
+  fi
+  printf "%s%s%s [y/N]: " "$(c_yellow)" "${q}" "$(c_reset)"
+  local ans=""
+  read -r ans
+  [[ "${ans}" =~ ^[Yy]$ ]]
 }
 
 apply_force_resolv_conf() {
@@ -630,8 +430,8 @@ apply_force_resolv_conf() {
   backup="$(backup_resolv_conf)"
 
   if resolv_conf_is_symlink; then
-    if ! wt_yesno "Warning" "Detected /etc/resolv.conf is a symlink.\n\nForce-writing will BREAK the symlink.\n\nProceed?"; then
-      wt_msg "Cancelled" "No changes were made."
+    if ! confirm "Detected /etc/resolv.conf is a symlink. Force-write will BREAK the symlink. Proceed?"; then
+      log_warn "Cancelled. No changes were made."
       return 1
     fi
     rm -f /etc/resolv.conf
@@ -644,7 +444,8 @@ apply_force_resolv_conf() {
   } > /etc/resolv.conf
   chmod 0644 /etc/resolv.conf
 
-  wt_msg "Applied" "Wrote /etc/resolv.conf:\n\nnameserver ${dns}\n\nBackup:\n${backup}"
+  log_info "Applied: wrote /etc/resolv.conf (nameserver ${dns})"
+  log_info "Backup: ${backup}"
 }
 
 write_resolved_dropin() {
@@ -675,7 +476,7 @@ apply_via_systemd_resolved() {
   ensure_dirs
 
   if ! systemd_resolved_active; then
-    wt_msg "systemd-resolved" "systemd-resolved is not active.\nFalling back to force-write method."
+    log_warn "systemd-resolved is not active. Falling back to force-write method."
     apply_force_resolv_conf "${dns}"
     return 0
   fi
@@ -687,8 +488,8 @@ apply_via_systemd_resolved() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl restart systemd-resolved
 
-  wt_msg "Applied (systemd-resolved)" \
-    "Configured systemd-resolved to use DNS=${dns}.\n\nNote: /etc/resolv.conf may remain a stub (e.g., 127.0.0.53) when managed by systemd-resolved.\n\nBackup of previous /etc/resolv.conf content:\n${backup}"
+  log_info "Applied via systemd-resolved: DNS=${dns}"
+  log_info "Backup of previous /etc/resolv.conf content: ${backup}"
 }
 
 verify_dns() {
@@ -719,47 +520,220 @@ verify_dns() {
       echo "FAILED"
     fi
   } > "${out_file}"
-  wt_textbox "Verification" "${out_file}"
+
+  pager_file "${out_file}"
 }
 
-apply_dns_flow_tui() {
-  local selected="$1"
-  local method="auto"
-  [[ -n "${FLAG_METHOD}" ]] && method="${FLAG_METHOD}"
+apply_dns_auto() {
+  local dns="$1"
+  local method="${FLAG_METHOD:-auto}"
 
-  if resolv_conf_symlink_managed_by_systemd && [[ "${method}" == "auto" ]]; then
-    local choice=""
-    choice="$(wt_menu "Apply method" \
-      "/etc/resolv.conf is managed by systemd-resolved.\n\nChoose how to apply DNS:" \
-      16 86 5 \
-      "resolved" "Recommended: configure systemd-resolved (safe)" \
-      "force"    "Force-write /etc/resolv.conf (break symlink)" \
-      "cancel"   "Cancel")" || true
-
-    case "${choice}" in
-      resolved) method="resolved" ;;
-      force)   method="force" ;;
-      *)       wt_msg "Cancelled" "No changes were made."; return 1 ;;
-    esac
-  elif [[ "${method}" == "auto" ]]; then
-    # If not systemd-managed, force is direct and works universally.
-    method="force"
-  fi
-
-  if ! wt_yesno "Confirm Apply" "Apply DNS:\n\n  ${selected}\n\nMethod: ${method}\n\nProceed?"; then
-    wt_msg "Cancelled" "No changes were made."
-    return 1
+  if [[ "${method}" == "auto" ]]; then
+    if resolv_conf_symlink_managed_by_systemd; then
+      method="resolved"
+    else
+      method="force"
+    fi
   fi
 
   case "${method}" in
-    resolved) apply_via_systemd_resolved "${selected}" ;;
-    force)   apply_force_resolv_conf "${selected}" ;;
-    *)       die "Unknown method: ${method}" ;;
+    resolved) apply_via_systemd_resolved "${dns}" ;;
+    force)   apply_force_resolv_conf "${dns}" ;;
+    *)       die "Unknown method: ${method} (use resolved|force|auto)" ;;
   esac
+}
+
+# ---------------------------
+# Backups restore
+# ---------------------------
+list_backups() { ls -1 "${BACKUP_DIR}"/resolv.conf.* 2>/dev/null | grep -v '\.meta$' || true; }
+
+meta_get() {
+  local file="$1" key="$2"
+  [[ -r "${file}" ]] || return 1
+  awk -F'=' -v k="${key}" '$1==k {sub(/^[^=]*=/,""); print $0; exit}' "${file}" 2>/dev/null
+}
+
+restore_backup_cli() {
+  local -a backups=()
+  mapfile -t backups < <(list_backups)
+  (( ${#backups[@]} > 0 )) || { log_warn "No backups found in ${BACKUP_DIR}"; return 0; }
+
+  echo
+  printf "%sAvailable backups:%s\n" "$(c_cyan)" "$(c_reset)"
+  local i=0 b
+  for b in "${backups[@]}"; do
+    i=$((i+1))
+    printf "  %s) %s\n" "${i}" "${b}"
+  done
+  echo
+
+  local pick=""
+  read -r -p "Select backup number (or Enter to cancel): " pick
+  pick="$(trim "${pick}")"
+  [[ -z "${pick}" ]] && return 0
+  [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Invalid input."; return 0; }
+  (( pick >= 1 && pick <= ${#backups[@]} )) || { log_warn "Out of range."; return 0; }
+
+  local chosen="${backups[$((pick-1))]}"
+  local meta="${chosen}.meta"
+  local is_link="0" target_rel=""
+  if [[ -r "${meta}" ]]; then
+    is_link="$(meta_get "${meta}" "IS_SYMLINK" || echo "0")"
+    target_rel="$(meta_get "${meta}" "SYMLINK_TARGET_REL" || echo "")"
+  fi
+
+  if [[ "${is_link}" == "1" && -n "${target_rel}" ]]; then
+    echo
+    printf "%sRestore mode:%s\n" "$(c_cyan)" "$(c_reset)"
+    echo "  1) Recreate symlink (/etc/resolv.conf -> ${target_rel})"
+    echo "  2) Restore file content (write file; breaks symlink)"
+    echo
+    local mode=""
+    read -r -p "Choose [1-2] (Enter=cancel): " mode
+    mode="$(trim "${mode}")"
+    [[ -z "${mode}" ]] && return 0
+    if [[ "${mode}" == "1" ]]; then
+      confirm "Recreate symlink /etc/resolv.conf -> ${target_rel}. This removes current resolv.conf. Proceed?" || return 0
+      rm -f /etc/resolv.conf
+      ln -s "${target_rel}" /etc/resolv.conf
+      log_info "Restored symlink: /etc/resolv.conf -> ${target_rel}"
+    elif [[ "${mode}" == "2" ]]; then
+      confirm "Restore backup content into /etc/resolv.conf (may break symlink). Proceed?" || return 0
+      rm -f /etc/resolv.conf
+      cp --preserve=mode,ownership,timestamps "${chosen}" /etc/resolv.conf
+      log_info "Restored content from: ${chosen}"
+    else
+      log_warn "Cancelled."
+      return 0
+    fi
+  else
+    confirm "Restore backup content into /etc/resolv.conf? Proceed?" || return 0
+    rm -f /etc/resolv.conf
+    cp --preserve=mode,ownership,timestamps "${chosen}" /etc/resolv.conf
+    log_info "Restored content from: ${chosen}"
+  fi
 
   verify_dns
 }
 
+# ---------------------------
+# Pager / UI
+# ---------------------------
+pager_file() {
+  local f="$1"
+  if have_command less; then
+    less -R "${f}"
+  else
+    cat "${f}"
+  fi
+}
+
+clear_screen() {
+  if is_tty; then
+    clear || true
+  fi
+}
+
+ubuntu_pretty() {
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    printf "%s %s" "${NAME:-Ubuntu}" "${VERSION_ID:-}"
+  else
+    printf "Ubuntu"
+  fi
+}
+
+dns_management_status() {
+  if resolv_conf_symlink_managed_by_systemd; then
+    printf "systemd-resolved (symlink)"
+  elif resolv_conf_is_symlink; then
+    printf "symlink (unknown target)"
+  else
+    printf "file"
+  fi
+}
+
+current_nameserver_summary() {
+  # show first nameserver line
+  awk '/^nameserver[[:space:]]+/ {print $2; exit}' /etc/resolv.conf 2>/dev/null || true
+}
+
+print_banner() {
+  clear_screen
+  printf "%s" "$(c_blue)"
+  cat <<'EOF'
+ ____  _   _ ____   __        __              _
+|  _ \| \ | / ___|  \ \      / /_ _ _ __   __| | ___ _ __
+| | | |  \| \___ \   \ \ /\ / / _` | '_ \ / _` |/ _ \ '_ \
+| |_| | |\  |___) |   \ V  V / (_| | | | | (_| |  __/ | | |
+|____/|_| \_|____/     \_/\_/ \__,_|_| |_|\__,_|\___|_| |_|
+
+EOF
+  printf "%s" "$(c_reset)"
+
+  local host ver mgmt ns
+  host="$(hostname 2>/dev/null || echo "unknown")"
+  ver="$(ubuntu_pretty)"
+  mgmt="$(dns_management_status)"
+  ns="$(current_nameserver_summary)"
+  [[ -z "${ns}" ]] && ns="(unknown)"
+
+  printf "%sVersion:%s v%s\n" "$(c_dim)" "$(c_reset)" "${APP_VERSION}"
+  printf "%sOS:%s %s   %sHost:%s %s\n" "$(c_dim)" "$(c_reset)" "${ver}" "$(c_dim)" "$(c_reset)" "${host}"
+  printf "%sDNS Mgmt:%s %s   %sCurrent NS:%s %s\n" "$(c_dim)" "$(c_reset)" "${mgmt}" "$(c_dim)" "$(c_reset)" "${ns}"
+  printf "%sList:%s %s\n" "$(c_dim)" "$(c_reset)" "${LIST_FILE}"
+  printf "%sBackups:%s %s\n" "$(c_dim)" "$(c_reset)" "${BACKUP_DIR}"
+  printf "%sPing:%s count=%s timeout=%ss\n" "$(c_dim)" "$(c_reset)" "${PING_COUNT}" "${PING_TIMEOUT}"
+  echo
+}
+
+pause_any() {
+  if is_tty; then
+    printf "%sPress Enter to continue...%s" "$(c_dim)" "$(c_reset)"
+    read -r _ || true
+  fi
+}
+
+# ---------------------------
+# UX: Select DNS from ranked results (no whiptail)
+# ---------------------------
+select_dns_from_results() {
+  [[ -s "${LAST_RESULTS_FILE}" ]] || test_dns_list
+
+  local sorted="${TMP_DIR}/results.sorted"
+  sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
+
+  print_banner
+  printf "%sRanked DNS endpoints:%s\n" "$(c_cyan)" "$(c_reset)"
+  echo
+
+  local i=0 endpoint family loss avg score
+  while IFS='|' read -r endpoint family loss avg score; do
+    i=$((i+1))
+    # Color hint: low loss/low avg => greener
+    local col=""
+    if [[ "${loss}" =~ ^[0-9]+$ ]] && (( loss == 0 )); then col="$(c_green)"; else col="$(c_yellow)"; fi
+    printf "  %s%2d)%s %-42s  loss=%-3s%% avg=%-6sms score=%s\n" "${col}" "${i}" "$(c_reset)" "${endpoint}" "${loss}" "${avg}" "${score}"
+    (( i >= 25 )) && break
+  done < "${sorted}"
+
+  echo
+  local pick=""
+  read -r -p "Select DNS number (Enter=cancel): " pick
+  pick="$(trim "${pick}")"
+  [[ -z "${pick}" ]] && { printf ""; return 0; }
+  [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Invalid number."; printf ""; return 0; }
+  (( pick >= 1 && pick <= 25 )) || { log_warn "Out of range."; printf ""; return 0; }
+
+  local selected
+  selected="$(awk -F'|' -v n="${pick}" 'NR==n{print $1; exit}' "${sorted}")"
+  printf "%s" "${selected}"
+}
+
+# ---------------------------
+# Flows
+# ---------------------------
 view_current_dns_config() {
   local out="${TMP_DIR}/current.txt"
   {
@@ -790,121 +764,50 @@ view_current_dns_config() {
       echo "No resolvectl/systemd-resolve available."
     fi
   } > "${out}"
-
-  wt_textbox "Current DNS config" "${out}"
+  pager_file "${out}"
 }
 
 edit_dns_list() {
-  if (( INTERACTIVE != 1 )); then
-    wt_msg "Edit DNS list" "Non-interactive mode detected.\nEdit manually:\n\n  sudo nano ${LIST_FILE}"
-    return 0
-  fi
-
   local editor="${EDITOR:-}"
   if [[ -z "${editor}" ]]; then
-    if have_command nano; then
-      editor="nano"
-    elif have_command vi; then
-      editor="vi"
-    elif have_command vim; then
-      editor="vim"
+    if have_command nano; then editor="nano"
+    elif have_command vi; then editor="vi"
+    elif have_command vim; then editor="vim"
     fi
   fi
-
-  if [[ -z "${editor}" ]]; then
-    wt_msg "Editor missing" "No editor found (nano/vi/vim).\n\nInstall nano:\n  apt-get update && apt-get install -y nano"
-    return 1
-  fi
-
-  # Open editor in real terminal, not inside whiptail
-  clear || true
+  [[ -n "${editor}" ]] || { log_error "No editor found (nano/vi/vim). Install nano: apt-get install -y nano"; return 1; }
+  clear_screen
   "${editor}" "${LIST_FILE}"
 }
 
-list_backups() {
-  ls -1 "${BACKUP_DIR}"/resolv.conf.* 2>/dev/null | grep -v '\.meta$' || true
-}
+show_help_screen() {
+  local out="${TMP_DIR}/help.txt"
+  : > "${out}"
+  cat >> "${out}" <<EOF
+DNS Warden v${APP_VERSION}
 
-# Safe meta reader (no `source`)
-meta_get() {
-  # meta_get <file> <KEY>
-  local file="$1"
-  local key="$2"
-  [[ -r "${file}" ]] || return 1
-  # only accept KEY=VALUE lines; return VALUE
-  awk -F'=' -v k="${key}" '
-    $1==k {sub(/^[^=]*=/,""); print $0; exit}
-  ' "${file}" 2>/dev/null
-}
+Usage (Interactive):
+  sudo ./${SCRIPT_NAME}
 
-restore_backup_tui() {
-  local -a backups=()
-  mapfile -t backups < <(list_backups)
+Curl:
+  curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/dns-warden.sh | sudo bash
 
-  if (( ${#backups[@]} == 0 )); then
-    wt_msg "Restore" "No backups found in:\n${BACKUP_DIR}"
-    return 0
-  fi
+Non-interactive:
+  --test
+    sudo ./${SCRIPT_NAME} --test
 
-  local -a opts=()
-  local f base
-  for f in "${backups[@]}"; do
-    base="$(basename "${f}")"
-    opts+=("${f}" "${base}")
-  done
+  --apply <dns> [--method auto|resolved|force] --yes
+    sudo ./${SCRIPT_NAME} --apply 1.1.1.1 --method auto --yes
 
-  local chosen=""
-  if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-    chosen="$(wt_menu "Restore backup" "Select a backup to restore:" 22 100 12 "${opts[@]}")" || true
-  else
-    chosen="${backups[0]}"
-  fi
+Files:
+  DNS list: ${LIST_FILE}
+  Backups:  ${BACKUP_DIR}
 
-  [[ -n "${chosen}" ]] || return 0
-
-  local meta="${chosen}.meta"
-  local is_link="0" target_rel=""
-  if [[ -r "${meta}" ]]; then
-    is_link="$(meta_get "${meta}" "IS_SYMLINK" || echo "0")"
-    target_rel="$(meta_get "${meta}" "SYMLINK_TARGET_REL" || echo "")"
-  fi
-
-  local restore_mode="content"
-  if [[ "${is_link}" == "1" && -n "${target_rel}" ]]; then
-    if (( HAVE_WHIPTAIL == 1 && INTERACTIVE == 1 )); then
-      restore_mode="$(wt_menu "Restore mode" \
-        "This backup was taken when /etc/resolv.conf was a symlink.\n\nChoose restore behavior:" \
-        16 92 4 \
-        "symlink" "Recreate symlink (/etc/resolv.conf -> ${target_rel})" \
-        "content" "Restore file content (break symlink; write file)" \
-        "cancel"  "Cancel")" || true
-    else
-      restore_mode="content"
-    fi
-  fi
-
-  case "${restore_mode}" in
-    cancel|"") return 0 ;;
-    symlink)
-      if ! wt_yesno "Confirm" "Recreate symlink:\n\n/etc/resolv.conf -> ${target_rel}\n\nThis will remove current /etc/resolv.conf. Proceed?"; then
-        return 0
-      fi
-      rm -f /etc/resolv.conf
-      ln -s "${target_rel}" /etc/resolv.conf
-      wt_msg "Restored" "Symlink restored:\n/etc/resolv.conf -> ${target_rel}"
-      ;;
-    content)
-      if ! wt_yesno "Confirm" "Restore backup content into /etc/resolv.conf?\n\nThis may break any existing symlink. Proceed?"; then
-        return 0
-      fi
-      rm -f /etc/resolv.conf
-      cp --preserve=mode,ownership,timestamps "${chosen}" /etc/resolv.conf
-      wt_msg "Restored" "Restored content from:\n${chosen}"
-      ;;
-    *) return 0 ;;
-  esac
-
-  verify_dns
+Notes:
+  - If /etc/resolv.conf is managed by systemd-resolved, 'resolved' method is safest.
+  - Force method can break the /etc/resolv.conf symlink.
+EOF
+  pager_file "${out}"
 }
 
 # ---------------------------
@@ -913,31 +816,14 @@ restore_backup_tui() {
 apply_dns_cli() {
   local dns="$1"
   local method="${FLAG_METHOD:-auto}"
-
   dns="$(trim "${dns}")"
   [[ -n "${dns}" ]] || die "--apply value is empty"
 
   if (( FLAG_YES != 1 )); then
-    if (( INTERACTIVE == 1 )); then
-      wt_yesno "Confirm Apply" "Apply DNS '${dns}' using method '${method}'?" || die "Cancelled."
-    else
-      die "Refusing to apply without explicit confirmation. Re-run with --yes."
-    fi
+    die "Refusing to apply without explicit confirmation. Re-run with --yes."
   fi
 
-  if [[ "${method}" == "auto" ]]; then
-    if resolv_conf_symlink_managed_by_systemd; then
-      method="resolved"
-    else
-      method="force"
-    fi
-  fi
-
-  case "${method}" in
-    resolved) apply_via_systemd_resolved "${dns}" ;;
-    force)   apply_force_resolv_conf "${dns}" ;;
-    *)       die "Unknown method: ${method} (use resolved|force|auto)" ;;
-  esac
+  apply_dns_auto "${dns}"
 
   [[ -L /etc/resolv.conf ]] && log_info "SYMLINK: /etc/resolv.conf -> $(readlink /etc/resolv.conf)"
   log_info "Final /etc/resolv.conf:"
@@ -959,11 +845,10 @@ test_dns_cli() {
 # ---------------------------
 usage() {
   cat <<EOF
-${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (whiptail TUI)
+${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (Rathole_v2-style TUI)
 
 Usage:
   sudo bash ${SCRIPT_NAME}
-  bash ${SCRIPT_NAME}
 
 Options:
   -h, --help              Show this help
@@ -971,7 +856,7 @@ Options:
   --count <n>             Ping count per endpoint (default: ${PING_COUNT_DEFAULT})
   --timeout <sec>         Ping timeout per packet (default: ${PING_TIMEOUT_DEFAULT})
   --test                  Run tests and print results (no TUI)
-  --apply <dns|hostname>  Apply a specific DNS (requires --yes if non-interactive)
+  --apply <dns|hostname>  Apply a specific DNS (requires --yes)
   --method <auto|resolved|force>
   --yes                   Non-interactive confirmation for --apply
 EOF
@@ -1007,66 +892,98 @@ parse_args() {
 }
 
 # ---------------------------
-# Main menu loop (FULL TUI)
+# Main Menu (Rathole_v2-style)
 # ---------------------------
 menu_loop() {
   while true; do
+    print_banner
+    printf "%s1.%s Test DNS list (ping + rank)\n" "$(c_green)" "$(c_reset)"
+    printf "%s2.%s Select & Apply DNS\n"         "$(c_red)"   "$(c_reset)"
+    printf "%s3.%s View current DNS config\n"    "$(c_blue)"  "$(c_reset)"
+    printf "%s4.%s Edit DNS list\n"             "$(c_green)" "$(c_reset)"
+    printf "%s5.%s Restore backup\n"            "$(c_green)" "$(c_reset)"
+    printf "%s6.%s Help\n"                      "$(c_green)" "$(c_reset)"
+    printf "%s0.%s Exit\n"                      "$(c_dim)"   "$(c_reset)"
+    echo
+    printf "%sEnter your choice [0-6]: %s" "$(c_cyan)" "$(c_reset)"
+
     local choice=""
-    choice="$(wt_menu "Main Menu" \
-      "Select an action:" \
-      18 78 8 \
-      "1" "Test DNS list (ping + rank)" \
-      "2" "Select & Apply DNS" \
-      "3" "View current DNS config" \
-      "4" "Edit DNS list" \
-      "5" "Restore backup" \
-      "6" "Help" \
-      "0" "Exit")" || true
+    read -r choice || true
+    choice="$(trim "${choice}")"
 
     case "${choice}" in
       1)
-        wt_msg "Working..." "Testing DNS endpoints...\n\nPlease wait."
         test_dns_list
-        wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
+        pager_file "${LAST_TABLE_FILE}"
+        pause_any
         ;;
       2)
-        wt_msg "Working..." "Testing DNS endpoints...\n\nPlease wait."
         test_dns_list
-        wt_textbox "DNS Test Results" "${LAST_TABLE_FILE}"
         local selected=""
-        selected="$(select_best_dns_tui)" || true
-        if [[ -n "${selected}" ]]; then
-          apply_dns_flow_tui "${selected}"
-        else
-          wt_msg "Cancelled" "No DNS selected."
+        selected="$(select_dns_from_results || true)"
+        selected="$(trim "${selected}")"
+        if [[ -z "${selected}" ]]; then
+          log_warn "No DNS selected."
+          pause_any
+          continue
         fi
+
+        # UX: auto-detect method + show confirmation
+        local method="auto"
+        [[ -n "${FLAG_METHOD}" ]] && method="${FLAG_METHOD}"
+        if [[ "${method}" == "auto" ]]; then
+          if resolv_conf_symlink_managed_by_systemd; then method="resolved"; else method="force"; fi
+        fi
+
+        echo
+        printf "%sApply DNS:%s %s\n" "$(c_cyan)" "$(c_reset)" "${selected}"
+        printf "%sMethod:%s %s\n"    "$(c_cyan)" "$(c_reset)" "${method}"
+        echo
+        confirm "Proceed to apply?" || { log_warn "Cancelled."; pause_any; continue; }
+
+        FLAG_METHOD="${method}"
+        apply_dns_auto "${selected}"
+        verify_dns
+        pause_any
         ;;
-      3) view_current_dns_config ;;
-      4) edit_dns_list ;;
-      5) restore_backup_tui ;;
-      6) show_help_screen ;;
-      0|"") break ;;
-      *) wt_msg "Invalid" "Invalid choice." ;;
+      3)
+        view_current_dns_config
+        pause_any
+        ;;
+      4)
+        edit_dns_list
+        ;;
+      5)
+        restore_backup_cli
+        pause_any
+        ;;
+      6)
+        show_help_screen
+        pause_any
+        ;;
+      0|"")
+        break
+        ;;
+      *)
+        log_warn "Invalid choice."
+        pause_any
+        ;;
     esac
   done
 }
 
 main() {
-  INTERACTIVE=0
-  is_interactive && INTERACTIVE=1
-
   detect_script_dir
   detect_ubuntu_or_exit
   ensure_root
 
-  # Parse args BEFORE init_list_file so --list works
   parse_args "$@"
 
   init_tmp
   ensure_dirs
   init_list_file
 
-  have_command ping || die "Missing dependency: ping (iputils-ping)"
+  have_command ping   || die "Missing dependency: ping (iputils-ping)"
   have_command getent || die "Missing dependency: getent (libc-bin)"
 
   if [[ -n "${FLAG_APPLY_DNS}" ]]; then
@@ -1079,11 +996,8 @@ main() {
     return 0
   fi
 
-  if (( INTERACTIVE == 1 )); then
-    ensure_whiptail
-    if (( HAVE_WHIPTAIL != 1 )); then
-      die "Interactive mode requires whiptail, but it could not be installed."
-    fi
+  # Interactive menu (terminal)
+  if [[ -t 0 && -t 1 ]]; then
     menu_loop
   else
     usage
