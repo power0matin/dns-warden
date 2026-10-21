@@ -27,6 +27,7 @@
 ```bash
 chmod +x dns-warden.sh
 sudo ./dns-warden.sh
+```
 
 ## Contact
 
