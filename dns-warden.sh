@@ -340,7 +340,7 @@ test_dns_endpoint() {
       IFS='|' read -r status query_ms ok ad answers <<< "${result}"
       total=$((total + 1))
       [[ "${ad}" == "YES" ]] && ad_count=$((ad_count + 1))
-      printf "%s|%s|UDP|%s|%s|%s|%s\n" "${endpoint}" "${domain}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
+      printf "%s|%s|UDP|%s|%s|%s|%s|\n" "${endpoint}" "${domain}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
       if [[ "${ok}" == "1" ]]; then
         successful=$((successful + 1))
         if [[ "${query_ms}" =~ ^[0-9]+$ ]] && (( query_ms < 9999 )); then
@@ -360,12 +360,12 @@ test_dns_endpoint() {
   tcp_result="$(query_dns "${endpoint}" "github.com" "tcp")"
   IFS='|' read -r status query_ms ok ad answers <<< "${tcp_result}"
   if [[ "${ok}" == "1" ]]; then tcp_status="OK"; else tcp_status="FAIL"; fi
-  printf "%s|github.com|TCP|%s|%s|%s|%s\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|github.com|TCP|%s|%s|%s|%s|\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
 
   bind_result="$(detect_bind_fingerprint "${endpoint}")"
   bind_status="${bind_result%%|*}"
   bind_value="${bind_result#*|}"
-  printf "%s|version.bind|CHAOS|%s||| |%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|version.bind|CHAOS|%s|||%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
 
   local score
   score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + (avg*10) }')"
