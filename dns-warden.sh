@@ -46,18 +46,21 @@ set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-dns-warden.sh}")"
 APP_VERSION="${VERSION}"
 
-PING_COUNT_DEFAULT=3
-PING_TIMEOUT_DEFAULT=2
-PING_COUNT="${PING_COUNT_DEFAULT}"
-PING_TIMEOUT="${PING_TIMEOUT_DEFAULT}"
+DNS_COUNT_DEFAULT=1
+DNS_TIMEOUT_DEFAULT=1
+DNS_COUNT="${DNS_COUNT_DEFAULT}"
+DNS_TIMEOUT="${DNS_TIMEOUT_DEFAULT}"
+DNS_TEST_DOMAINS=("github.com" "api.github.com" "openai.com" "google.com" "steamcommunity.com")
+FLAG_BIND_ONLY=0
 
 SCRIPT_DIR=""
 CONFIG_DIR="/etc/dns-warden"
 BACKUP_DIR="/var/backups/dns-warden"
+REPORT_DIR="/var/log/dns-warden"
 LIST_FILE=""
 
 TMP_DIR=""
@@ -109,8 +112,8 @@ trap cleanup EXIT INT TERM
 have_command() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_dirs() {
-  mkdir -p "${CONFIG_DIR}" "${BACKUP_DIR}"
-  chmod 0755 "${CONFIG_DIR}" "${BACKUP_DIR}"
+  mkdir -p "${CONFIG_DIR}" "${BACKUP_DIR}" "${REPORT_DIR}"
+  chmod 0755 "${CONFIG_DIR}" "${BACKUP_DIR}" "${REPORT_DIR}"
 }
 
 detect_script_dir() {
@@ -267,121 +270,167 @@ read_dns_list() {
 }
 
 ###############################################################################
-# Ping testing (optimized)
+# Direct DNS testing
 ###############################################################################
-# NOTE: ping output parsing assumes iputils ping format on Ubuntu [web:8]
-ping_one() {
-  local endpoint="$1"
+# A resolver must return valid DNS answers; ICMP ping is informational only and
+# is not used as a health check or ranking signal.
+query_dns() {
+  local endpoint="$1" domain="$2" transport="${3:-udp}"
+  local -a transport_args=()
+  [[ "${transport}" == "tcp" ]] && transport_args=(+tcp)
 
-  local family="" ip_for_ping="" display="${endpoint}"
-  local resolved="" ip=""
-
-  if is_ipv4 "${endpoint}"; then
-    family="4"; ip_for_ping="${endpoint}"
-  elif is_ipv6 "${endpoint}"; then
-    family="6"; ip_for_ping="${endpoint}"
-  else
-    if resolved="$(resolve_prefer_v4_then_v6 "${endpoint}" 2>/dev/null)"; then
-      family="${resolved%% *}"
-      ip="${resolved#* }"
-      ip_for_ping="${ip}"
-    else
-      family="4"
-      ip_for_ping="${endpoint}"
-    fi
-  fi
-
-  local ping_cmd="ping" ping_args=()
-  if [[ "${family}" == "6" ]]; then
-    if have_command ping6; then
-      ping_cmd="ping6"
-      ping_args=(-c "${PING_COUNT}" -W "${PING_TIMEOUT}")
-    else
-      ping_args=(-6 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
-    fi
-  else
-    ping_args=(-4 -c "${PING_COUNT}" -W "${PING_TIMEOUT}")
-  fi
-
-  local out rc
+  local out status answers query_ms
   set +e
-  out="$("${ping_cmd}" "${ping_args[@]}" "${ip_for_ping}" 2>&1)"
-  rc=$?
+  out="$(dig "${transport_args[@]}" +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" "${domain}" A +noall +comments +stats +answer 2>&1)"
   set -e
 
-  local loss="100" avg="9999"
-  local line
-  while IFS= read -r line; do
-    case "${line}" in
-      *"packet loss"*)
-        loss="${line##* }"
-        loss="${loss%%%*}"
-        [[ -z "${loss}" ]] && loss="100"
-        ;;
-      *"rtt min/avg/max/mdev"*|*"round-trip min/avg/max/stddev"*)
-        line="${line#*=}"
-        line="$(trim "${line}")"
-        avg="${line#*/}"
-        avg="${avg%%/*}"
-        ;;
-    esac
-  done <<< "${out}"
+  status="$(awk -F'status: ' '/HEADER/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
+  answers="$(awk -F'ANSWER: ' '/QUERY:/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
+  query_ms="$(awk '/Query time:/ {print $4; exit}' <<< "${out}")"
 
-  if [[ -z "${avg}" ]]; then avg="9999"; fi
-  if [[ -z "${loss}" ]]; then loss="100"; fi
+  [[ "${status}" =~ ^[A-Z]+$ ]] || status="NO_RESPONSE"
+  [[ "${answers}" =~ ^[0-9]+$ ]] || answers=0
+  [[ "${query_ms}" =~ ^[0-9]+$ ]] || query_ms=9999
 
-  local score
-  score="$(awk -v a="${avg}" -v l="${loss}" 'BEGIN{printf "%.3f", a + (l*1000)}')"
-  printf "%s|%s|%s|%s|%s\n" "${display}" "${family}" "${loss}" "${avg}" "${score}"
-  return "${rc}"
+  local ok=0
+  if [[ "${status}" == "NOERROR" ]] && (( answers > 0 )); then
+    ok=1
+  fi
+
+  printf "%s|%s|%s\n" "${status}" "${query_ms}" "${ok}"
+}
+
+detect_bind_fingerprint() {
+  local endpoint="$1" raw value lower
+  set +e
+  raw="$(dig +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" version.bind TXT CH +short 2>/dev/null)"
+  set -e
+  value="$(tr -d '"' <<< "${raw}" | head -n 1 | tr -d '\r')"
+  value="$(trim "${value}")"
+  lower="${value,,}"
+
+  if [[ "${lower}" == *bind* ]]; then
+    printf "BIND_SIGNATURE"
+  elif [[ "${value}" =~ ^(9|10)\.[0-9]+ ]]; then
+    # Typical ISC BIND version format; suggestive, not cryptographic proof.
+    printf "BIND_VERSION_LIKE"
+  elif [[ -n "${value}" ]]; then
+    printf "OTHER_VERSION"
+  else
+    printf "HIDDEN"
+  fi
+}
+
+test_dns_endpoint() {
+  local endpoint="$1"
+  local successful=0 total=0 latency_sum=0 latency_samples=0
+  local domain repetition result status query_ms ok
+
+  for domain in "${DNS_TEST_DOMAINS[@]}"; do
+    for ((repetition=1; repetition<=DNS_COUNT; repetition++)); do
+      result="$(query_dns "${endpoint}" "${domain}" "udp")"
+      IFS='|' read -r status query_ms ok <<< "${result}"
+      total=$((total + 1))
+      if [[ "${ok}" == "1" ]]; then
+        successful=$((successful + 1))
+        if [[ "${query_ms}" =~ ^[0-9]+$ ]] && (( query_ms < 9999 )); then
+          latency_sum=$((latency_sum + query_ms))
+          latency_samples=$((latency_samples + 1))
+        fi
+      fi
+    done
+  done
+
+  local avg_ms="9999"
+  if (( latency_samples > 0 )); then
+    avg_ms="$(awk -v s="${latency_sum}" -v n="${latency_samples}" 'BEGIN { printf "%.2f", s/n }')"
+  fi
+
+  local tcp_result tcp_status bind_status score
+  tcp_result="$(query_dns "${endpoint}" "github.com" "tcp")"
+  IFS='|' read -r status query_ms ok <<< "${tcp_result}"
+  if [[ "${ok}" == "1" ]]; then tcp_status="OK"; else tcp_status="FAIL"; fi
+
+  bind_status="$(detect_bind_fingerprint "${endpoint}")"
+  score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + (avg*10) }')"
+
+  printf "%s|%s|%s|%s|%s|%s|%s\n" \
+    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}"
+}
+
+filter_sorted_results() {
+  local input="$1" output="$2"
+  if (( FLAG_BIND_ONLY == 1 )); then
+    awk -F'|' '$6 == "BIND_SIGNATURE" || $6 == "BIND_VERSION_LIKE"' "${input}" > "${output}"
+  else
+    cp "${input}" "${output}"
+  fi
 }
 
 build_results_table() {
   [[ -s "${LAST_RESULTS_FILE}" ]] || die "No results to display."
   local sorted="${TMP_DIR}/results.sorted"
-  sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
+  local filtered="${TMP_DIR}/results.filtered"
+  sort -t'|' -k7,7n "${LAST_RESULTS_FILE}" > "${sorted}"
+  filter_sorted_results "${sorted}" "${filtered}"
 
   {
     printf "DNS Warden v%s\n" "${APP_VERSION}"
     printf "List file: %s\n" "${LIST_FILE}"
-    printf "Backups:   %s\n" "${BACKUP_DIR}"
-    printf "Ping:      count=%s timeout=%ss\n" "${PING_COUNT}" "${PING_TIMEOUT}"
+    printf "Reports:   %s\n" "${REPORT_DIR}"
+    printf "Queries:   %s per domain; timeout=%ss\n" "${DNS_COUNT}" "${DNS_TIMEOUT}"
+    printf "Domains:   %s\n" "${DNS_TEST_DOMAINS[*]}"
+    if (( FLAG_BIND_ONLY == 1 )); then printf "Filter:    BIND fingerprint candidates only\n"; fi
     printf "\n"
-    printf "Results (sorted by score; lower is better)\n"
-    printf -- "------------------------------------------------------------\n"
-    printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "Rank" "DNS" "Loss%" "Avg(ms)" "Score"
-    printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "----" "------------------------------------------" "------" "-------" "----------"
+    printf "Results (healthy DNS responses first, then lower latency)\n"
+    printf -- "-----------------------------------------------------------------------------------------------\n"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "Score"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "----------"
 
-    local rank=0 endpoint family loss avg score
-    while IFS='|' read -r endpoint family loss avg score; do
-      rank=$((rank + 1))
-      printf "%-4s  %-42s  %-6s  %-7s  %-10s\n" "${rank}" "${endpoint}" "${loss}" "${avg}" "${score}"
-    done < "${sorted}"
+    local rank=0 endpoint ok_count total avg tcp bind score
+    if [[ ! -s "${filtered}" ]]; then
+      printf "\nNo resolver matched the active filter.\n"
+    else
+      while IFS='|' read -r endpoint ok_count total avg tcp bind score; do
+        rank=$((rank + 1))
+        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" \
+          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${score}"
+      done < "${filtered}"
+    fi
 
     printf "\nNotes:\n"
-    printf -- "- Hostnames are resolved (prefer IPv4; fallback IPv6).\n"
-    printf -- "- Loss is heavily penalized in score (loss*1000).\n"
+    printf -- "- DNS health is measured with direct A queries to each resolver over UDP.\n"
+    printf -- "- TCP is checked separately against github.com; it is not part of the rank score.\n"
+    printf -- "- BIND detection uses the optional version.bind CHAOS TXT response. HIDDEN is inconclusive.\n"
+    printf -- "- BIND_VERSION_LIKE is only a fingerprint hint, not proof of the implementation.\n"
+    printf -- "- Private resolver addresses work only when the current network routes them.\n"
   } > "${LAST_TABLE_FILE}"
 }
 
 test_dns_list() {
   local -a entries=()
   mapfile -t entries < <(read_dns_list "${LIST_FILE}")
-
   : > "${LAST_RESULTS_FILE}"
 
-  local total="${#entries[@]}"
-  local i=0 e
-  for e in "${entries[@]}"; do
-    i=$((i+1))
+  local total="${#entries[@]}" i=0 endpoint
+  log_info "Testing ${total} resolver entries with direct DNS queries..."
+  for endpoint in "${entries[@]}"; do
+    i=$((i + 1))
     if is_tty; then
       printf "\r%sTesting DNS...%s %s/%s  " "$(c_cyan)" "$(c_reset)" "${i}" "${total}"
     fi
-    ping_one "${e}" >> "${LAST_RESULTS_FILE}" || true
+    test_dns_endpoint "${endpoint}" >> "${LAST_RESULTS_FILE}" || true
   done
   if is_tty; then printf "\r%sTesting DNS...%s done.           \n" "$(c_green)" "$(c_reset)"; fi
 
   build_results_table
+
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp "${LAST_RESULTS_FILE}" "${REPORT_DIR}/dns-results-${ts}.txt"
+  cp "${LAST_TABLE_FILE}" "${REPORT_DIR}/dns-results-${ts}.report.txt"
+  log_info "Raw results: ${REPORT_DIR}/dns-results-${ts}.txt"
+  log_info "Ranked report: ${REPORT_DIR}/dns-results-${ts}.report.txt"
 }
 
 ###############################################################################
@@ -700,7 +749,7 @@ EOF
   printf "%sDNS Mgmt:%s %s   %sCurrent NS:%s %s\n" "$(c_dim)" "$(c_reset)" "${mgmt}" "$(c_dim)" "$(c_reset)" "${ns}"
   printf "%sList:%s %s\n" "$(c_dim)" "$(c_reset)" "${LIST_FILE}"
   printf "%sBackups:%s %s\n" "$(c_dim)" "$(c_reset)" "${BACKUP_DIR}"
-  printf "%sPing:%s count=%s timeout=%ss\n" "$(c_dim)" "$(c_reset)" "${PING_COUNT}" "${PING_TIMEOUT}"
+  printf "%sDNS test:%s count=%s/domain timeout=%ss\n" "$(c_dim)" "$(c_reset)" "${DNS_COUNT}" "${DNS_TIMEOUT}"
   echo
 }
 
@@ -823,6 +872,8 @@ Files:
   Backups:  ${BACKUP_DIR}
 
 Notes:
+  - DNS testing uses dig and direct queries to each listed resolver.
+  - --bind-only keeps only explicit/likely BIND version fingerprints; this is not proof.
   - If /etc/resolv.conf is managed by systemd-resolved, 'resolved' method is safest.
   - Force method can break the /etc/resolv.conf symlink.
 EOF
@@ -872,9 +923,10 @@ Usage:
 Options:
   -h, --help              Show this help
   --list <path>           Use an alternate DNS list file
-  --count <n>             Ping count per endpoint (default: ${PING_COUNT_DEFAULT})
-  --timeout <sec>         Ping timeout per packet (default: ${PING_TIMEOUT_DEFAULT})
-  --test                  Run tests and print results (no TUI)
+  --count <n>             DNS query repetitions per domain (default: ${DNS_COUNT_DEFAULT})
+  --timeout <sec>         DNS query timeout in seconds (default: ${DNS_TIMEOUT_DEFAULT})
+  --test                  Run direct DNS tests and print results (no TUI)
+  --bind-only             Show/select only BIND fingerprint candidates
   --apply <dns|hostname>  Apply a specific DNS (requires --yes)
   --method <auto|resolved|force>
   --yes                   Non-interactive confirmation for --apply
@@ -886,9 +938,10 @@ parse_args() {
     case "$1" in
       -h|--help) usage; exit 0 ;;
       --list)    [[ $# -ge 2 ]] || die "--list requires a path"; FLAG_LIST_OVERRIDE="$2"; shift 2 ;;
-      --count)   [[ $# -ge 2 ]] || die "--count requires a number"; PING_COUNT="$2"; shift 2 ;;
-      --timeout) [[ $# -ge 2 ]] || die "--timeout requires seconds"; PING_TIMEOUT="$2"; shift 2 ;;
-      --test)    FLAG_TEST_ONLY=1; shift ;;
+      --count)      [[ $# -ge 2 ]] || die "--count requires a number"; DNS_COUNT="$2"; shift 2 ;;
+      --timeout)    [[ $# -ge 2 ]] || die "--timeout requires seconds"; DNS_TIMEOUT="$2"; shift 2 ;;
+      --test)       FLAG_TEST_ONLY=1; shift ;;
+      --bind-only)  FLAG_BIND_ONLY=1; shift ;;
       --apply)   [[ $# -ge 2 ]] || die "--apply requires a DNS endpoint/hostname"; FLAG_APPLY_DNS="$2"; shift 2 ;;
       --method)  [[ $# -ge 2 ]] || die "--method requires auto|resolved|force"; FLAG_METHOD="$2"; shift 2 ;;
       --yes)     FLAG_YES=1; shift ;;
@@ -897,10 +950,10 @@ parse_args() {
     esac
   done
 
-  [[ "${PING_COUNT}" =~ ^[0-9]+$ ]] || die "--count must be an integer"
-  [[ "${PING_TIMEOUT}" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
-  (( PING_COUNT >= 1 && PING_COUNT <= 20 )) || die "--count must be in range 1..20"
-  (( PING_TIMEOUT >= 1 && PING_TIMEOUT <= 10 )) || die "--timeout must be in range 1..10"
+  [[ "${DNS_COUNT}" =~ ^[0-9]+$ ]] || die "--count must be an integer"
+  [[ "${DNS_TIMEOUT}" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
+  (( DNS_COUNT >= 1 && DNS_COUNT <= 5 )) || die "--count must be in range 1..5"
+  (( DNS_TIMEOUT >= 1 && DNS_TIMEOUT <= 10 )) || die "--timeout must be in range 1..10"
 
   if [[ -n "${FLAG_METHOD}" ]]; then
     case "${FLAG_METHOD}" in
@@ -916,7 +969,7 @@ parse_args() {
 menu_loop() {
   while true; do
     print_banner
-    printf "%s1.%s Test DNS list (ping + rank)\n" "$(c_green)" "$(c_reset)"
+    printf "%s1.%s Test DNS list (real DNS queries + rank)\n" "$(c_green)" "$(c_reset)"
     printf "%s2.%s Select & Apply DNS\n"         "$(c_red)"   "$(c_reset)"
     printf "%s3.%s View current DNS config\n"    "$(c_blue)"  "$(c_reset)"
     printf "%s4.%s Edit DNS list\n"             "$(c_green)" "$(c_reset)"
@@ -1004,7 +1057,7 @@ main() {
   ensure_dirs
   init_list_file
 
-  have_command ping   || die "Missing dependency: ping (iputils-ping)"
+  have_command dig    || die "Missing dependency: dig. Install it with: apt-get update && apt-get install -y dnsutils"
   have_command getent || die "Missing dependency: getent (libc-bin)"
 
   if [[ -n "${FLAG_APPLY_DNS}" ]]; then
