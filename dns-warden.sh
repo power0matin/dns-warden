@@ -290,7 +290,7 @@ query_dns() {
   status="$(awk -F'status: ' '/HEADER/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
   answers="$(awk -F'ANSWER: ' '/QUERY:/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
   query_ms="$(awk '/Query time:/ {print $4; exit}' <<< "${out}")"
-  flags="$(awk '/HEADER/ {if (match($0,/flags: [^;]+/)) {x=substr($0,RSTART,RLENGTH); sub(/^flags: /,"",x); print x; exit}}' <<< "${out}")"
+  flags="$(awk '/flags:/ {if (match($0,/flags: [^;]+/)) {x=substr($0,RSTART,RLENGTH); sub(/^flags: /,"",x); print x; exit}}' <<< "${out}")"
 
   [[ "${status}" =~ ^[A-Z]+$ ]] || status="NO_RESPONSE"
   [[ "${answers}" =~ ^[0-9]+$ ]] || answers=0
