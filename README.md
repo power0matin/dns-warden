@@ -9,7 +9,7 @@
 - TCP DNS query reachability. TCP failures receive a ranking penalty because reliable DNS service should support both transports.
 - DNSSEC behavior using a signed positive control (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). The broken domain is queried normally and with Checking Disabled (`CD`).
 - DNSSEC validation is classified separately as `VALIDATES`, `DOES_NOT_VALIDATE`, or `INCONCLUSIVE`. `VALIDATES` requires a successful positive control, normal `SERVFAIL` for the broken domain, and a successful answer when `CD` is set.
-- The positive control is queried with `AD) requested. Its response signal is reported independently as `AD_PRESENT`, `AD_ABSENT`, or `INCONCLUSIVE`; an absent AD flag is not automatically treated as proof that validation is disabled.
+- The positive control is queried with `+adflag`. Its response signal is reported independently as `AD_PRESENT`, `AD_ABSENT`, or `INCONCLUSIVE`; an absent AD flag is not automatically treated as proof that validation is disabled.
 - Optional `version.bind` CHAOS TXT fingerprint. Network errors are reported as `NO_RESPONSE`; a hidden response is **inconclusive**. Only an explicit BIND version-like response is classified as a BIND candidate.
 - Per-query A-record values, answer count, RCODE, latency, AD flag, and DNSSEC test mode in a separate detail report.
 - Resolver list includes Iranian public/community candidates, ISP-routed/private candidates, and international public baselines.
