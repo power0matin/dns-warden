@@ -46,7 +46,7 @@ set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-dns-warden.sh}")"
 APP_VERSION="${VERSION}"
 
@@ -317,23 +317,31 @@ query_dns() {
 }
 
 classify_dnssec_validation() {
-  local positive_status="$1" positive_answers="$2"
-  local bad_status="$3" bad_answers="$4"
-  local cd_status="$5" cd_answers="$6"
+  local positive_status="$1" positive_answers="$2" positive_ad="$3"
+  local bad_status="$4" bad_answers="$5"
+  local cd_status="$6" cd_answers="$7"
 
   if [[ "${positive_status}" == "NOERROR" ]] &&
      (( positive_answers > 0 )) &&
      [[ "${bad_status}" == "SERVFAIL" ]] &&
      [[ "${cd_status}" == "NOERROR" ]] &&
      (( cd_answers > 0 )); then
-    printf "VALIDATES"
+    if [[ "${positive_ad}" == "YES" ]]; then
+      printf "VALIDATES"
+    else
+      printf "LIKELY_VALIDATES"
+    fi
   elif [[ "${positive_status}" == "NOERROR" ]] &&
        (( positive_answers > 0 )) &&
        [[ "${bad_status}" == "NOERROR" ]] &&
        (( bad_answers > 0 )) &&
        [[ "${cd_status}" == "NOERROR" ]] &&
        (( cd_answers > 0 )); then
-    printf "DOES_NOT_VALIDATE"
+    if [[ "${positive_ad}" == "YES" ]]; then
+      printf "INCONSISTENT"
+    else
+      printf "DOES_NOT_VALIDATE"
+    fi
   else
     printf "INCONCLUSIVE"
   fi
@@ -435,7 +443,7 @@ test_dns_endpoint() {
   IFS='|' read -r bad_cd_status bad_cd_ms ok bad_cd_ad bad_cd_answers bad_cd_data <<< "${dnssec_bad_cd}"
 
   dnssec_status="$(classify_dnssec_validation \
-    "${good_status}" "${good_answers}" \
+    "${good_status}" "${good_answers}" "${good_ad}" \
     "${bad_status}" "${bad_answers}" \
     "${bad_cd_status}" "${bad_cd_answers}")"
   dnssec_ad_status="$(classify_dnssec_ad_signal "${good_status}" "${good_answers}" "${good_ad}")"
