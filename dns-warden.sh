@@ -46,7 +46,7 @@ set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-dns-warden.sh}")"
 APP_VERSION="${VERSION}"
 
@@ -439,8 +439,8 @@ build_results_table() {
     printf "\n"
     printf "Results (healthy DNS responses first, then lower latency)\n"
     printf -- "----------------------------------------------------------------------------------------------------------\n"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "DNSSEC" "AD" "Score"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "---------------------" "--------" "----------"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "DNSSEC" "AD" "Score" "Fingerprint"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "---------------------" "--------" "----------" "-----------------------------------"
 
     local rank=0 endpoint ok_count total avg tcp bind score ad_count bind_value dnssec
     if [[ ! -s "${filtered}" ]]; then
@@ -448,8 +448,8 @@ build_results_table() {
     else
       while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value dnssec; do
         rank=$((rank + 1))
-        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s\n" \\
-          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${dnssec}" "${ad_count}/${total}" "${score}"
+        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" \
+          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${dnssec}" "${ad_count}/${total}" "${score}" "${bind_value}"
       done < "${filtered}"
     fi
 
@@ -840,7 +840,7 @@ select_dns_from_results() {
     i=$((i+1))
     local col=""
     if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then col="$(c_green)"; else col="$(c_yellow)"; fi
-    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s DNSSEC=%-18s BIND=%s\n" \\
+    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s DNSSEC=%-18s BIND=%s\n" \
       "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${dnssec}" "${bind}"
     (( i >= 25 )) && break
   done < "${filtered}"
