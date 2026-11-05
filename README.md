@@ -7,9 +7,11 @@
 - UDP DNS A-query success rate against a small, fixed domain matrix.
 - Average DNS query latency for successful answers.
 - TCP DNS query reachability. TCP failures receive a ranking penalty because reliable DNS service should support both transports.
-- DNSSEC behavior using a signed positive test domain (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). Results are indicative, not a formal DNSSEC audit.
+- DNSSEC behavior using a signed positive control (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). The broken domain is queried normally and with Checking Disabled (`CD`).
+- DNSSEC validation is classified separately as `VALIDATES`, `DOES_NOT_VALIDATE`, or `INCONCLUSIVE`. `VALIDATES` requires a successful positive control, normal `SERVFAIL` for the broken domain, and a successful answer when `CD` is set.
+- The positive control is queried with `AD) requested. Its response signal is reported independently as `AD_PRESENT`, `AD_ABSENT`, or `INCONCLUSIVE`; an absent AD flag is not automatically treated as proof that validation is disabled.
 - Optional `version.bind` CHAOS TXT fingerprint. Network errors are reported as `NO_RESPONSE`; a hidden response is **inconclusive**. Only an explicit BIND version-like response is classified as a BIND candidate.
-- Per-domain A-record values, answer count, RCODE, latency, and AD flag in a separate detail report.
+- Per-query A-record values, answer count, RCODE, latency, AD flag, and DNSSEC test mode in a separate detail report.
 - Resolver list includes Iranian public/community candidates, ISP-routed/private candidates, and international public baselines.
 
 **Important:** DNS cannot change your public IP or bypass IP-geolocation sanctions. It may help only where a service is affected by DNS-level filtering or resolution. DNS latency is not download throughput. Private addresses such as `10.202.x.x`, `10.x.x.x`, `172.16/12` and `192.168/16` are tested only if the server's network routes them.
@@ -94,7 +96,9 @@ sudo bash ./dns-warden.sh --apply 178.22.122.100 --method auto --yes
 - `force`: replace `/etc/resolv.conf`; this can break a symlink and should be avoided unless intentional.
 
 Backups are stored under `/var/backups/dns-warden`; benchmark reports are stored under `/var/log/dns-warden`.
-The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, transport, RCODE, answer count, A-record values, query time, AD flag, and the BIND fingerprint result. The summary's `AD` column counts authenticated responses from the main test matrix; it is a signal, not a complete DNSSEC audit. The `DNSSEC` column is based on the positive and intentionally-broken DNSSEC test domains; filtering, interception, or test-domain changes can make it inconclusive.
+The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, test type (UDP, TCP, DNSSEC positive, DNSSEC normal, or DNSSEC CD), RCODE, answer count, A-record values, query time, AD flag, and the BIND fingerprint result. The summary's `AD count` is from the main test matrix; the separate `AD signal` comes from the signed positive control queried with `+adflag`.
+
+The `DNSSEC validation` result compares the intentionally-broken domain under normal checking and with `+cdflag`. A `VALIDATES` result is strong operational evidence when normal checking returns `SERVFAIL` but the CD query returns answers. `DOES_NOT_VALIDATE` means the broken-domain control returned answers in both modes. `INCONCLUSIVE` is used when the control behavior does not fit either pattern. These probes are not a formal audit; upstream filtering, transient failures, or changes to the test domain can affect the result. An `AD_ABSENT` signal is reported separately and must not be confused with the negative-control result.
 
 
 ## Catalog format
@@ -105,7 +109,7 @@ Edit `dns-list.txt`: one IP address or hostname per line; blank lines and `#` co
 
 - Benchmarking sends DNS queries to every configured resolver. This reveals the tested domain names to those resolver operators.
 - A resolver may be reachable by UDP but not TCP, or vice versa; both are tested and TCP failure affects ranking.
-- DNSSEC validation is probed independently from the main ranking. A `NO_VALIDATION_SIGNAL` result is not proof that the server never validates DNSSEC.
+- DNSSEC validation is probed independently from the main ranking. The normal/CD comparison and the AD signal are deliberately separate; neither alone is a complete security audit.
 - ICMP ping is not used for ranking because DNS servers commonly rate-limit or block ping while still answering DNS.
 - DNS query timing is measured from this server's current network path. A VPS outside Iran cannot reproduce an Iranian ISP's resolver reachability or latency.
 - The tool does not silently change DNS during `--test`.
