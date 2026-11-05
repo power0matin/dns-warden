@@ -365,7 +365,7 @@ test_dns_endpoint() {
   bind_result="$(detect_bind_fingerprint "${endpoint}")"
   bind_status="${bind_result%%|*}"
   bind_value="${bind_result#*|}"
-  printf "%s|version.bind|CHAOS|%s|%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|version.bind|CHAOS|%s||| |%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
 
   local score
   score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + (avg*10) }')"
@@ -429,7 +429,7 @@ test_dns_list() {
   local -a entries=()
   mapfile -t entries < <(read_dns_list "${LIST_FILE}")
   : > "${LAST_RESULTS_FILE}"
-  : > "${LAST_DETAILS_FILE}"
+  printf "resolver|domain|transport|rcode_or_status|answers|latency_ms|ad|fingerprint\\n" > "${LAST_DETAILS_FILE}"
 
   local total="${#entries[@]}" i=0 endpoint
   log_info "Testing ${total} resolver entries with direct DNS queries..."
