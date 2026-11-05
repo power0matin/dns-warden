@@ -17,23 +17,31 @@ assert_eq() {
 }
 
 assert_eq "VALIDATES" \
-  "$(classify_dnssec_validation NOERROR 3 SERVFAIL 0 NOERROR 2)" \
-  "normal SERVFAIL + CD answers indicates validation"
+  "$(classify_dnssec_validation NOERROR 3 YES SERVFAIL 0 NOERROR 2)" \
+  "normal SERVFAIL + CD answers + positive AD confirms validation"
+
+assert_eq "LIKELY_VALIDATES" \
+  "$(classify_dnssec_validation NOERROR 3 NO SERVFAIL 0 NOERROR 2)" \
+  "normal SERVFAIL + CD answers without positive AD is partial evidence"
 
 assert_eq "DOES_NOT_VALIDATE" \
-  "$(classify_dnssec_validation NOERROR 3 NOERROR 2 NOERROR 2)" \
-  "broken-domain answers in both modes indicate no validation signal"
+  "$(classify_dnssec_validation NOERROR 3 NO NOERROR 2 NOERROR 2)" \
+  "broken-domain answers in both modes without AD indicate no validation"
+
+assert_eq "INCONSISTENT" \
+  "$(classify_dnssec_validation NOERROR 3 YES NOERROR 2 NOERROR 2)" \
+  "positive AD conflicts with accepting the broken domain"
 
 assert_eq "INCONCLUSIVE" \
-  "$(classify_dnssec_validation NOERROR 3 SERVFAIL 0 SERVFAIL 0)" \
+  "$(classify_dnssec_validation NOERROR 3 NO SERVFAIL 0 SERVFAIL 0)" \
   "SERVFAIL in both modes is inconclusive"
 
 assert_eq "INCONCLUSIVE" \
-  "$(classify_dnssec_validation SERVFAIL 0 SERVFAIL 0 NOERROR 2)" \
+  "$(classify_dnssec_validation SERVFAIL 0 NO SERVFAIL 0 NOERROR 2)" \
   "failed positive control is inconclusive"
 
 assert_eq "INCONCLUSIVE" \
-  "$(classify_dnssec_validation NOERROR 3 SERVFAIL 0 NOERROR 0)" \
+  "$(classify_dnssec_validation NOERROR 3 NO SERVFAIL 0 NOERROR 0)" \
   "CD NOERROR without answers is inconclusive"
 
 assert_eq "AD_PRESENT" \
