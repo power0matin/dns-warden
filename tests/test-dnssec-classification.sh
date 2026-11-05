@@ -55,14 +55,50 @@ export DNS_WARDEN_TEST_DIG_LOG="${MOCK_DIR}/dig-args.log"
 mkdir -p "${MOCK_DIR}/bin"
 cat > "${MOCK_DIR}/bin/dig" <<'MOCK_DIG'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${DNS_WARDEN_TEST_DIG_LOG}"
-cat <<'DNS_RESPONSE'
+args="$*"
+printf '%s\n' "${args}" >> "${DNS_WARDEN_TEST_DIG_LOG}"
+
+if [[ "${args}" == *"version.bind"* ]]; then
+  cat <<'DNS_RESPONSE'
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
+;; flags: qr aa rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+;; ANSWER SECTION:
+version.bind. 0 CH TXT "9.18.0"
+;; Query time: 1 msec
+DNS_RESPONSE
+elif [[ "${args}" == *"dnssec-failed.org"* && "${args}" == *"+cdflag"* ]]; then
+  cat <<'DNS_RESPONSE'
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
+;; flags: qr rd ra cd; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+;; ANSWER SECTION:
+dnssec-failed.org. 60 IN A 192.0.2.9
+dnssec-failed.org. 60 IN RRSIG A 8 2 60 20300101000000 20290101000000 12345 dnssec-failed.org. FAKE
+;; Query time: 1 msec
+DNS_RESPONSE
+elif [[ "${args}" == *"dnssec-failed.org"* ]]; then
+  cat <<'DNS_RESPONSE'
+;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1234
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1
+;; Query time: 2 msec
+DNS_RESPONSE
+elif [[ "${args}" == *"cloudflare.com"* ]]; then
+  cat <<'DNS_RESPONSE'
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
+;; flags: qr rd ra ad; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+;; ANSWER SECTION:
+cloudflare.com. 60 IN A 192.0.2.10
+cloudflare.com. 60 IN RRSIG A 8 2 60 20300101000000 20290101000000 12345 cloudflare.com. FAKE
+;; Query time: 1 msec
+DNS_RESPONSE
+else
+  cat <<'DNS_RESPONSE'
 ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
 ;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
 ;; ANSWER SECTION:
-example.test. 60 IN A 192.0.2.1
+github.com. 60 IN A 192.0.2.1
 ;; Query time: 1 msec
 DNS_RESPONSE
+fi
 MOCK_DIG
 chmod +x "${MOCK_DIR}/bin/dig"
 export PATH="${MOCK_DIR}/bin:${PATH}"
@@ -82,4 +118,25 @@ grep -q -- '+adflag' "${DNS_WARDEN_TEST_DIG_LOG}"
 grep -q -- '+cdflag' "${DNS_WARDEN_TEST_DIG_LOG}"
 printf "PASS: CD probe sends both +adflag and +cdflag\n"
 
-printf "All DNSSEC classification tests passed.\n"
+# Exercise the endpoint integration and its 11-field summary with deterministic dig output.
+DNS_COUNT=1
+DNS_TIMEOUT=1
+DNS_TEST_DOMAINS=("github.com")
+LAST_DETAILS_FILE="${MOCK_DIR}/endpoint.details.txt"
+: > "${LAST_DETAILS_FILE}"
+
+summary="$(test_dns_endpoint 192.0.2.53)"
+IFS='|' read -r endpoint successful total avg tcp bind score ad_count bind_value dnssec ad_signal <<< "${summary}"
+assert_eq "192.0.2.53" "${endpoint}" "endpoint summary address"
+assert_eq "5" "${successful}/${total}" "UDP and TCP probes all succeed"
+assert_eq "OK" "${tcp}" "TCP status is included in endpoint summary"
+assert_eq "BIND_VERSION_LIKE" "${bind}" "BIND-like fingerprint is preserved"
+assert_eq "VALIDATES" "${dnssec}" "normal-vs-CD result reaches endpoint summary"
+assert_eq "AD_PRESENT" "${ad_signal}" "AD signal reaches endpoint summary"
+
+grep -q '^192\.0\.2\.53|cloudflare\.com|DNSSEC_POSITIVE|NOERROR|2|' "${LAST_DETAILS_FILE}"
+grep -q '^192\.0\.2\.53|dnssec-failed\.org|DNSSEC_NORMAL|SERVFAIL|0|' "${LAST_DETAILS_FILE}"
+grep -q '^192\.0\.2\.53|dnssec-failed\.org|DNSSEC_CD|NOERROR|2|' "${LAST_DETAILS_FILE}"
+printf "PASS: per-query report contains all three DNSSEC probe rows\n"
+
+printf "All DNSSEC classification and integration tests passed.\n"
