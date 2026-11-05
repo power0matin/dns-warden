@@ -32,7 +32,24 @@ Recommended: clone the repository and inspect the script before running it as ro
 ```bash
 git clone https://github.com/power0matin/dns-warden.git
 cd dns-warden
+set -euo pipefail
 bash -n dns-warden.sh
+python3 - <<'PY'
+import ipaddress
+from pathlib import Path
+
+entries = []
+for raw in Path("dns-list.txt").read_text().splitlines():
+    value = raw.split("#", 1)[0].strip()
+    if not value:
+        continue
+    ipaddress.ip_address(value)
+    entries.append(value)
+
+assert entries, "DNS catalog is empty"
+assert len(entries) == len(set(entries)), "Duplicate DNS entries found"
+print(f"{len(entries)} unique IP resolvers")
+PY
 sudo bash ./dns-warden.sh --test
 ```
 
@@ -75,6 +92,8 @@ sudo bash ./dns-warden.sh --apply 178.22.122.100 --method auto --yes
 - `force`: replace `/etc/resolv.conf`; this can break a symlink and should be avoided unless intentional.
 
 Backups are stored under `/var/backups/dns-warden`; benchmark reports are stored under `/var/log/dns-warden`.
+The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, transport, RCODE, answer count, query time, and the AD flag when present. The summary's `AD` column counts authenticated responses; it is a signal, not a complete DNSSEC audit.
+
 
 ## Catalog format
 
