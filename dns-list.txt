@@ -84,7 +84,6 @@
 85.15.1.14
 85.15.1.15
 # Pars Online (reported)
-91.99.101.12
 #
 # IRAN - private / ISP-routed ONLY (not public Internet resolvers)
 # 403 Online
