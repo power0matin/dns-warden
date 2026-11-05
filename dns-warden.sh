@@ -66,6 +66,7 @@ LIST_FILE=""
 TMP_DIR=""
 LAST_RESULTS_FILE=""
 LAST_TABLE_FILE=""
+LAST_DETAILS_FILE=""
 
 FLAG_TEST_ONLY=0
 FLAG_APPLY_DNS=""
@@ -156,6 +157,7 @@ init_tmp() {
   chmod 0700 "${TMP_DIR}"
   LAST_RESULTS_FILE="${TMP_DIR}/results.raw"
   LAST_TABLE_FILE="${TMP_DIR}/results.table.txt"
+  LAST_DETAILS_FILE="${TMP_DIR}/results.details.txt"
 }
 
 trim() {
@@ -276,61 +278,69 @@ read_dns_list() {
 # is not used as a health check or ranking signal.
 query_dns() {
   local endpoint="$1" domain="$2" transport="${3:-udp}"
-  local -a transport_args=()
-  [[ "${transport}" == "tcp" ]] && transport_args=(+tcp)
+  local -a transport_args=(+dnssec)
+  [[ "${transport}" == "tcp" ]] && transport_args+=(+tcp)
 
-  local out status answers query_ms
+  local out status answers query_ms flags ad dig_rc
   set +e
   out="$(dig "${transport_args[@]}" +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" "${domain}" A +noall +comments +stats +answer 2>&1)"
+  dig_rc=$?
   set -e
 
   status="$(awk -F'status: ' '/HEADER/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
   answers="$(awk -F'ANSWER: ' '/QUERY:/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
   query_ms="$(awk '/Query time:/ {print $4; exit}' <<< "${out}")"
+  flags="$(awk '/HEADER/ {if (match($0,/flags: [^;]+/)) {x=substr($0,RSTART,RLENGTH); sub(/^flags: /,"",x); print x; exit}}' <<< "${out}")"
 
   [[ "${status}" =~ ^[A-Z]+$ ]] || status="NO_RESPONSE"
   [[ "${answers}" =~ ^[0-9]+$ ]] || answers=0
   [[ "${query_ms}" =~ ^[0-9]+$ ]] || query_ms=9999
+  ad="NO"
+  [[ " ${flags} " == *" ad "* ]] && ad="YES"
 
   local ok=0
-  if [[ "${status}" == "NOERROR" ]] && (( answers > 0 )); then
+  if [[ "${status}" == "NOERROR" ]] && (( answers > 0 )) && (( dig_rc == 0 )); then
     ok=1
   fi
 
-  printf "%s|%s|%s\n" "${status}" "${query_ms}" "${ok}"
+  printf "%s|%s|%s|%s|%s\n" "${status}" "${query_ms}" "${ok}" "${ad}" "${answers}"
 }
 
 detect_bind_fingerprint() {
-  local endpoint="$1" raw value lower
+  local endpoint="$1" raw value lower kind
   set +e
   raw="$(dig +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" version.bind TXT CH +short 2>/dev/null)"
   set -e
   value="$(tr -d '"' <<< "${raw}" | head -n 1 | tr -d '\r')"
   value="$(trim "${value}")"
   lower="${value,,}"
+  value="${value//|//}"
+  value="${value//$'\t'/ }"
+  [[ -n "${value}" ]] || value="(hidden or refused)"
 
+  kind="HIDDEN"
   if [[ "${lower}" == *bind* ]]; then
-    printf "BIND_SIGNATURE"
+    kind="BIND_SIGNATURE"
   elif [[ "${value}" =~ ^(9|10)\.[0-9]+ ]]; then
-    # Typical ISC BIND version format; suggestive, not cryptographic proof.
-    printf "BIND_VERSION_LIKE"
-  elif [[ -n "${value}" ]]; then
-    printf "OTHER_VERSION"
-  else
-    printf "HIDDEN"
+    kind="BIND_VERSION_LIKE"
+  elif [[ "${value}" != "(hidden or refused)" ]]; then
+    kind="OTHER_VERSION"
   fi
+  printf "%s|%s" "${kind}" "${value}"
 }
 
 test_dns_endpoint() {
   local endpoint="$1"
-  local successful=0 total=0 latency_sum=0 latency_samples=0
-  local domain repetition result status query_ms ok
+  local successful=0 total=0 latency_sum=0 latency_samples=0 ad_count=0
+  local domain repetition result status query_ms ok ad answers
 
   for domain in "${DNS_TEST_DOMAINS[@]}"; do
     for ((repetition=1; repetition<=DNS_COUNT; repetition++)); do
       result="$(query_dns "${endpoint}" "${domain}" "udp")"
-      IFS='|' read -r status query_ms ok <<< "${result}"
+      IFS='|' read -r status query_ms ok ad answers <<< "${result}"
       total=$((total + 1))
+      [[ "${ad}" == "YES" ]] && ad_count=$((ad_count + 1))
+      printf "%s|%s|UDP|%s|%s|%s|%s\n" "${endpoint}" "${domain}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
       if [[ "${ok}" == "1" ]]; then
         successful=$((successful + 1))
         if [[ "${query_ms}" =~ ^[0-9]+$ ]] && (( query_ms < 9999 )); then
@@ -346,17 +356,24 @@ test_dns_endpoint() {
     avg_ms="$(awk -v s="${latency_sum}" -v n="${latency_samples}" 'BEGIN { printf "%.2f", s/n }')"
   fi
 
-  local tcp_result tcp_status bind_status score
+  local tcp_result tcp_status bind_result bind_status bind_value
   tcp_result="$(query_dns "${endpoint}" "github.com" "tcp")"
-  IFS='|' read -r status query_ms ok <<< "${tcp_result}"
+  IFS='|' read -r status query_ms ok ad answers <<< "${tcp_result}"
   if [[ "${ok}" == "1" ]]; then tcp_status="OK"; else tcp_status="FAIL"; fi
+  printf "%s|github.com|TCP|%s|%s|%s|%s\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
 
-  bind_status="$(detect_bind_fingerprint "${endpoint}")"
+  bind_result="$(detect_bind_fingerprint "${endpoint}")"
+  bind_status="${bind_result%%|*}"
+  bind_value="${bind_result#*|}"
+  printf "%s|version.bind|CHAOS|%s|%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
+
+  local score
   score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + (avg*10) }')"
 
-  printf "%s|%s|%s|%s|%s|%s|%s\n" \
-    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}"
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}" "${ad_count}" "${bind_value}"
 }
+
 
 filter_sorted_results() {
   local input="$1" output="$2"
@@ -383,26 +400,27 @@ build_results_table() {
     if (( FLAG_BIND_ONLY == 1 )); then printf "Filter:    BIND fingerprint candidates only\n"; fi
     printf "\n"
     printf "Results (healthy DNS responses first, then lower latency)\n"
-    printf -- "-----------------------------------------------------------------------------------------------\n"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "Score"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "----------"
+    printf -- "----------------------------------------------------------------------------------------------------------\n"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-8s  %-10s  %-35s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "AD" "Score" "Fingerprint"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-8s  %-10s  %-35s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "--------" "----------" "-----------------------------------"
 
-    local rank=0 endpoint ok_count total avg tcp bind score
+    local rank=0 endpoint ok_count total avg tcp bind score ad_count bind_value
     if [[ ! -s "${filtered}" ]]; then
       printf "\nNo resolver matched the active filter.\n"
     else
-      while IFS='|' read -r endpoint ok_count total avg tcp bind score; do
+      while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value; do
         rank=$((rank + 1))
-        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-10s\n" \
-          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${score}"
+        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-8s  %-10s  %-35s\n" \
+          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${ad_count}/${total}" "${score}" "${bind_value}"
       done < "${filtered}"
     fi
 
     printf "\nNotes:\n"
     printf -- "- DNS health is measured with direct A queries to each resolver over UDP.\n"
     printf -- "- TCP is checked separately against github.com; it is not part of the rank score.\n"
-    printf -- "- BIND detection uses the optional version.bind CHAOS TXT response. HIDDEN is inconclusive.\n"
-    printf -- "- BIND_VERSION_LIKE is only a fingerprint hint, not proof of the implementation.\n"
+    printf -- "- AD counts responses authenticated by the resolver; 0 does not prove validation is disabled.\n"
+    printf -- "- BIND detection uses version.bind CHAOS TXT. HIDDEN is inconclusive; a version-like string is only a hint.\n"
+    printf -- "- Per-domain RCODE, answer count, latency and AD details are in the .details.txt report.\n"
     printf -- "- Private resolver addresses work only when the current network routes them.\n"
   } > "${LAST_TABLE_FILE}"
 }
@@ -411,6 +429,7 @@ test_dns_list() {
   local -a entries=()
   mapfile -t entries < <(read_dns_list "${LIST_FILE}")
   : > "${LAST_RESULTS_FILE}"
+  : > "${LAST_DETAILS_FILE}"
 
   local total="${#entries[@]}" i=0 endpoint
   log_info "Testing ${total} resolver entries with direct DNS queries..."
@@ -429,8 +448,10 @@ test_dns_list() {
   ts="$(date +%Y%m%d-%H%M%S)"
   cp "${LAST_RESULTS_FILE}" "${REPORT_DIR}/dns-results-${ts}.txt"
   cp "${LAST_TABLE_FILE}" "${REPORT_DIR}/dns-results-${ts}.report.txt"
+  cp "${LAST_DETAILS_FILE}" "${REPORT_DIR}/dns-results-${ts}.details.txt"
   log_info "Raw results: ${REPORT_DIR}/dns-results-${ts}.txt"
   log_info "Ranked report: ${REPORT_DIR}/dns-results-${ts}.report.txt"
+  log_info "Per-domain details: ${REPORT_DIR}/dns-results-${ts}.details.txt"
 }
 
 ###############################################################################
@@ -775,17 +796,13 @@ select_dns_from_results() {
   printf "%sRanked DNS endpoints:%s\n" "$(c_cyan)" "$(c_reset)"
   echo
 
-  local i=0 endpoint ok_count total avg tcp bind score
-  while IFS='|' read -r endpoint ok_count total avg tcp bind score; do
+  local i=0 endpoint ok_count total avg tcp bind score ad_count bind_value
+  while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value; do
     i=$((i+1))
     local col=""
-    if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then
-      col="$(c_green)"
-    else
-      col="$(c_yellow)"
-    fi
-    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s BIND=%s\n" \
-      "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}"
+    if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then col="$(c_green)"; else col="$(c_yellow)"; fi
+    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s AD=%-5s BIND=%s\\n" \
+      "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${ad_count}/${total}" "${bind}"
     (( i >= 25 )) && break
   done < "${filtered}"
 
