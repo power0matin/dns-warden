@@ -46,7 +46,7 @@ set -euo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-dns-warden.sh}")"
 APP_VERSION="${VERSION}"
 
@@ -277,9 +277,16 @@ read_dns_list() {
 # A resolver must return valid DNS answers; ICMP ping is informational only and
 # is not used as a health check or ranking signal.
 query_dns() {
-  local endpoint="$1" domain="$2" transport="${3:-udp}"
+  local endpoint="$1" domain="$2" transport="${3:-udp}" dnssec_mode="${4:-default}"
   local -a transport_args=(+dnssec)
   [[ "${transport}" == "tcp" ]] && transport_args+=(+tcp)
+
+  case "${dnssec_mode}" in
+    ad) transport_args+=(+adflag) ;;
+    cd) transport_args+=(+adflag +cdflag) ;;
+    default) ;;
+    *) die "Internal error: unknown DNSSEC query mode: ${dnssec_mode}" ;;
+  esac
 
   local out status answers query_ms flags ad dig_rc answer_data
   set +e
@@ -307,6 +314,41 @@ query_dns() {
   fi
 
   printf "%s|%s|%s|%s|%s|%s\n" "${status}" "${query_ms}" "${ok}" "${ad}" "${answers}" "${answer_data}"
+}
+
+classify_dnssec_validation() {
+  local positive_status="$1" positive_answers="$2"
+  local bad_status="$3" bad_answers="$4"
+  local cd_status="$5" cd_answers="$6"
+
+  if [[ "${positive_status}" == "NOERROR" ]] &&
+     (( positive_answers > 0 )) &&
+     [[ "${bad_status}" == "SERVFAIL" ]] &&
+     [[ "${cd_status}" == "NOERROR" ]] &&
+     (( cd_answers > 0 )); then
+    printf "VALIDATES"
+  elif [[ "${positive_status}" == "NOERROR" ]] &&
+       (( positive_answers > 0 )) &&
+       [[ "${bad_status}" == "NOERROR" ]] &&
+       (( bad_answers > 0 )) &&
+       [[ "${cd_status}" == "NOERROR" ]] &&
+       (( cd_answers > 0 )); then
+    printf "DOES_NOT_VALIDATE"
+  else
+    printf "INCONCLUSIVE"
+  fi
+}
+
+classify_dnssec_ad_signal() {
+  local positive_status="$1" positive_answers="$2" positive_ad="$3"
+
+  if [[ "${positive_status}" != "NOERROR" ]] || (( positive_answers == 0 )); then
+    printf "INCONCLUSIVE"
+  elif [[ "${positive_ad}" == "YES" ]]; then
+    printf "AD_PRESENT"
+  else
+    printf "AD_ABSENT"
+  fi
 }
 
 detect_bind_fingerprint() {
@@ -377,26 +419,30 @@ test_dns_endpoint() {
   if [[ "${ok}" == "1" ]]; then tcp_status="OK"; else tcp_status="FAIL"; fi
   printf "%s|github.com|TCP|%s|%s|%s|%s|%s|\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" "${answer_data}" >> "${LAST_DETAILS_FILE}"
 
-  local dnssec_good dnssec_bad good_status good_ad good_answers good_ms good_data
-  local bad_status bad_ad bad_answers bad_ms bad_data dnssec_status
-  dnssec_good="$(query_dns "${endpoint}" "cloudflare.com" "udp")"
+  local dnssec_good dnssec_bad dnssec_bad_cd
+  local good_status good_ad good_answers good_ms good_data
+  local bad_status bad_ad bad_answers bad_ms bad_data
+  local bad_cd_status bad_cd_ad bad_cd_answers bad_cd_ms bad_cd_data
+  local dnssec_status dnssec_ad_status
+
+  dnssec_good="$(query_dns "${endpoint}" "cloudflare.com" "udp" "ad")"
   IFS='|' read -r good_status good_ms ok good_ad good_answers good_data <<< "${dnssec_good}"
-  dnssec_bad="$(query_dns "${endpoint}" "dnssec-failed.org" "udp")"
+
+  dnssec_bad="$(query_dns "${endpoint}" "dnssec-failed.org" "udp" "ad")"
   IFS='|' read -r bad_status bad_ms ok bad_ad bad_answers bad_data <<< "${dnssec_bad}"
 
-  if [[ "${bad_status}" == "SERVFAIL" && "${good_ad}" == "YES" ]]; then
-    dnssec_status="VALIDATES"
-  elif [[ "${bad_status}" == "SERVFAIL" ]]; then
-    dnssec_status="LIKELY_VALIDATES"
-  elif [[ "${bad_status}" == "NOERROR" && "${good_ad}" == "YES" ]]; then
-    dnssec_status="INCONSISTENT"
-  elif [[ "${bad_status}" == "NOERROR" ]]; then
-    dnssec_status="NO_VALIDATION_SIGNAL"
-  else
-    dnssec_status="INCONCLUSIVE"
-  fi
-  printf "%s|cloudflare.com|DNSSEC-GOOD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${good_status}" "${good_answers}" "${good_ms}" "${good_ad}" "${good_data}" >> "${LAST_DETAILS_FILE}"
-  printf "%s|dnssec-failed.org|DNSSEC-BAD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_status}" "${bad_answers}" "${bad_ms}" "${bad_ad}" "${bad_data}" >> "${LAST_DETAILS_FILE}"
+  dnssec_bad_cd="$(query_dns "${endpoint}" "dnssec-failed.org" "udp" "cd")"
+  IFS='|' read -r bad_cd_status bad_cd_ms ok bad_cd_ad bad_cd_answers bad_cd_data <<< "${dnssec_bad_cd}"
+
+  dnssec_status="$(classify_dnssec_validation \
+    "${good_status}" "${good_answers}" \
+    "${bad_status}" "${bad_answers}" \
+    "${bad_cd_status}" "${bad_cd_answers}")"
+  dnssec_ad_status="$(classify_dnssec_ad_signal "${good_status}" "${good_answers}" "${good_ad}")"
+
+  printf "%s|cloudflare.com|DNSSEC_POSITIVE|%s|%s|%s|%s|%s|\n" "${endpoint}" "${good_status}" "${good_answers}" "${good_ms}" "${good_ad}" "${good_data}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|dnssec-failed.org|DNSSEC_NORMAL|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_status}" "${bad_answers}" "${bad_ms}" "${bad_ad}" "${bad_data}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|dnssec-failed.org|DNSSEC_CD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_cd_status}" "${bad_cd_answers}" "${bad_cd_ms}" "${bad_cd_ad}" "${bad_cd_data}" >> "${LAST_DETAILS_FILE}"
 
   bind_result="$(detect_bind_fingerprint "${endpoint}")"
   bind_status="${bind_result%%|*}"
@@ -408,8 +454,8 @@ test_dns_endpoint() {
   [[ "${tcp_status}" == "OK" ]] || tcp_penalty=1000
   score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" -v tcp="${tcp_penalty}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + tcp + (avg*10) }')"
 
-  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
-    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}" "${ad_count}" "${bind_value}" "${dnssec_status}"
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}" "${ad_count}" "${bind_value}" "${dnssec_status}" "${dnssec_ad_status}"
 }
 
 
@@ -439,27 +485,30 @@ build_results_table() {
     printf "\n"
     printf "Results (healthy DNS responses first, then lower latency)\n"
     printf -- "----------------------------------------------------------------------------------------------------------\n"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "DNSSEC" "AD" "Score" "Fingerprint"
-    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "---------------------" "--------" "----------" "-----------------------------------"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-14s  %-8s  %-10s  %-35s\n" "Rank" "Resolver" "DNS OK" "Avg(ms)" "TCP" "BIND check" "DNSSEC validation" "AD signal" "AD count" "Score" "Fingerprint"
+    printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-14s  %-8s  %-10s  %-35s\n" "----" "---------------------------------------" "---------" "---------" "------" "------------------" "---------------------" "--------------" "--------" "----------" "-----------------------------------"
 
-    local rank=0 endpoint ok_count total avg tcp bind score ad_count bind_value dnssec
+    local rank=0 endpoint ok_count total avg tcp bind score ad_count bind_value dnssec ad_signal
     if [[ ! -s "${filtered}" ]]; then
       printf "\nNo resolver matched the active filter.\n"
     else
-      while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value dnssec; do
+      while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value dnssec ad_signal; do
         rank=$((rank + 1))
-        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-8s  %-10s  %-35s\n" \
-          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${dnssec}" "${ad_count}/${total}" "${score}" "${bind_value}"
+        printf "%-4s  %-39s  %-9s  %-9s  %-6s  %-18s  %-21s  %-14s  %-8s  %-10s  %-35s\n" \
+          "${rank}" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}" "${dnssec}" "${ad_signal}" "${ad_count}/${total}" "${score}" "${bind_value}"
       done < "${filtered}"
     fi
 
     printf "\nNotes:\n"
     printf -- "- DNS health is measured with direct A queries to each resolver over UDP.\n"
     printf -- "- TCP reachability is included in ranking; TCP failures receive a penalty.\n"
-    printf -- "- DNSSEC is checked with a signed positive domain and dnssec-failed.org; the result is indicative, not a formal audit.\n"
-    printf -- "- AD counts authenticated responses from the primary domain matrix.\n"
+    printf -- "- DNSSEC checks use a signed positive control plus dnssec-failed.org queried normally and with CD.\n"
+    printf -- "- VALIDATES requires normal SERVFAIL and CD NOERROR with answers; DOES_NOT_VALIDATE means both return answers.\n"
+    printf -- "- DNSSEC AD signal is tested separately with +adflag; AD_ABSENT is not equivalent to DOES_NOT_VALIDATE.\n"
+    printf -- "- The DNSSEC probes are indicative, not a formal audit; filtering or test-domain changes can make them inconclusive.\n"
+    printf -- "- AD count is from the primary domain matrix and is separate from the DNSSEC AD signal.\n"
     printf -- "- BIND version query errors are NO_RESPONSE; non-BIND version strings are not classified as BIND.\n"
-    printf -- "- Per-domain RCODE, answer count, A records, latency and AD are in the .details.txt report.\n"
+    printf -- "- Per-query RCODE, answer count, A records, latency and AD are in the .details.txt report.\n"
     printf -- "- Private resolver addresses work only when the current network routes them.\n"
   } > "${LAST_TABLE_FILE}"
 }
@@ -468,7 +517,7 @@ test_dns_list() {
   local -a entries=()
   mapfile -t entries < <(read_dns_list "${LIST_FILE}")
   : > "${LAST_RESULTS_FILE}"
-  printf "resolver|domain|transport|rcode_or_status|answers|latency_ms|ad|answer_data|fingerprint\n" > "${LAST_DETAILS_FILE}"
+  printf "resolver|domain|test_type|rcode_or_status|answers|latency_ms|ad|answer_data|fingerprint\n" > "${LAST_DETAILS_FILE}"
 
   local total="${#entries[@]}" i=0 endpoint
   log_info "Testing ${total} resolver entries with direct DNS queries..."
@@ -835,13 +884,13 @@ select_dns_from_results() {
   printf "%sRanked DNS endpoints:%s\n" "$(c_cyan)" "$(c_reset)"
   echo
 
-  local i=0 endpoint ok_count total avg tcp bind score ad_count bind_value dnssec
-  while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value dnssec; do
+  local i=0 endpoint ok_count total avg tcp bind score ad_count bind_value dnssec ad_signal
+  while IFS='|' read -r endpoint ok_count total avg tcp bind score ad_count bind_value dnssec ad_signal; do
     i=$((i+1))
     local col=""
     if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then col="$(c_green)"; else col="$(c_yellow)"; fi
-    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s DNSSEC=%-18s BIND=%s\n" \
-      "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${dnssec}" "${bind}"
+    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s DNSSEC=%-19s AD=%-14s BIND=%s\n" \
+      "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${dnssec}" "${ad_signal}" "${bind}"
     (( i >= 25 )) && break
   done < "${filtered}"
 
@@ -1140,4 +1189,6 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${DNS_WARDEN_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi
