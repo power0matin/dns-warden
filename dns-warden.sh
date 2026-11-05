@@ -801,7 +801,7 @@ select_dns_from_results() {
     i=$((i+1))
     local col=""
     if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then col="$(c_green)"; else col="$(c_yellow)"; fi
-    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s AD=%-5s BIND=%s\n" \\
+    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s AD=%-5s BIND=%s\n" \
       "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${ad_count}/${total}" "${bind}"
     (( i >= 25 )) && break
   done < "${filtered}"
