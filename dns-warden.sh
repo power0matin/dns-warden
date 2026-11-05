@@ -767,24 +767,27 @@ select_dns_from_results() {
   [[ -s "${LAST_RESULTS_FILE}" ]] || test_dns_list
 
   local sorted="${TMP_DIR}/results.sorted"
-  sort -t'|' -k5,5n "${LAST_RESULTS_FILE}" > "${sorted}"
+  local filtered="${TMP_DIR}/results.selectable"
+  sort -t'|' -k7,7n "${LAST_RESULTS_FILE}" > "${sorted}"
+  filter_sorted_results "${sorted}" "${filtered}"
 
   print_banner
   printf "%sRanked DNS endpoints:%s\n" "$(c_cyan)" "$(c_reset)"
   echo
 
-  local i=0 endpoint family loss avg score
-  while IFS='|' read -r endpoint family loss avg score; do
+  local i=0 endpoint ok_count total avg tcp bind score
+  while IFS='|' read -r endpoint ok_count total avg tcp bind score; do
     i=$((i+1))
     local col=""
-    if [[ "${loss}" =~ ^[0-9]+$ ]] && (( loss == 0 )); then
+    if [[ "${ok_count}" == "${total}" && "${tcp}" == "OK" ]]; then
       col="$(c_green)"
     else
       col="$(c_yellow)"
     fi
-    printf "  %s%2d)%s %-42s  loss=%-3s%% avg=%-6sms score=%s\n" "${col}" "${i}" "$(c_reset)" "${endpoint}" "${loss}" "${avg}" "${score}"
+    printf "  %s%2d)%s %-39s DNS=%-5s avg=%-7sms TCP=%-4s BIND=%s\n" \
+      "${col}" "${i}" "$(c_reset)" "${endpoint}" "${ok_count}/${total}" "${avg}" "${tcp}" "${bind}"
     (( i >= 25 )) && break
-  done < "${sorted}"
+  done < "${filtered}"
 
   echo
   local pick=""
@@ -792,10 +795,13 @@ select_dns_from_results() {
   pick="$(trim "${pick}")"
   [[ -z "${pick}" ]] && { printf ""; return 0; }
   [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Invalid number."; printf ""; return 0; }
-  (( pick >= 1 && pick <= 25 )) || { log_warn "Out of range."; printf ""; return 0; }
+
+  local available
+  available="$(wc -l < "${filtered}")"
+  (( pick >= 1 && pick <= available )) || { log_warn "Out of range."; printf ""; return 0; }
 
   local selected
-  selected="$(awk -F'|' -v n="${pick}" 'NR==n{print $1; exit}' "${sorted}")"
+  selected="$(awk -F'|' -v n="${pick}" 'NR==n{print $1; exit}' "${filtered}")"
   printf "%s" "${selected}"
 }
 
