@@ -6,8 +6,10 @@
 
 - UDP DNS A-query success rate against a small, fixed domain matrix.
 - Average DNS query latency for successful answers.
-- TCP DNS query reachability (reported separately).
-- Optional `version.bind` CHAOS TXT fingerprint. A hidden response is **inconclusive**; it does not prove the server is not BIND. A version-like string is only a fingerprint hint, not proof.
+- TCP DNS query reachability. TCP failures receive a ranking penalty because reliable DNS service should support both transports.
+- DNSSEC behavior using a signed positive test domain (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). Results are indicative, not a formal DNSSEC audit.
+- Optional `version.bind` CHAOS TXT fingerprint. Network errors are reported as `NO_RESPONSE`; a hidden response is **inconclusive**. Only an explicit BIND version-like response is classified as a BIND candidate.
+- Per-domain A-record values, answer count, RCODE, latency, and AD flag in a separate detail report.
 - Resolver list includes Iranian public/community candidates, ISP-routed/private candidates, and international public baselines.
 
 **Important:** DNS cannot change your public IP or bypass IP-geolocation sanctions. It may help only where a service is affected by DNS-level filtering or resolution. DNS latency is not download throughput. Private addresses such as `10.202.x.x`, `10.x.x.x`, `172.16/12` and `192.168/16` are tested only if the server's network routes them.
@@ -92,7 +94,7 @@ sudo bash ./dns-warden.sh --apply 178.22.122.100 --method auto --yes
 - `force`: replace `/etc/resolv.conf`; this can break a symlink and should be avoided unless intentional.
 
 Backups are stored under `/var/backups/dns-warden`; benchmark reports are stored under `/var/log/dns-warden`.
-The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, transport, RCODE, answer count, query time, and the AD flag when present. The summary's `AD` column counts authenticated responses; it is a signal, not a complete DNSSEC audit.
+The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, transport, RCODE, answer count, A-record values, query time, AD flag, and the BIND fingerprint result. The summary's `AD` column counts authenticated responses from the main test matrix; it is a signal, not a complete DNSSEC audit. The `DNSSEC` column is based on the positive and intentionally-broken DNSSEC test domains; filtering, interception, or test-domain changes can make it inconclusive.
 
 
 ## Catalog format
@@ -102,7 +104,8 @@ Edit `dns-list.txt`: one IP address or hostname per line; blank lines and `#` co
 ## Safety and interpretation
 
 - Benchmarking sends DNS queries to every configured resolver. This reveals the tested domain names to those resolver operators.
-- A resolver may be reachable by UDP but not TCP, or vice versa; both are reported separately.
+- A resolver may be reachable by UDP but not TCP, or vice versa; both are tested and TCP failure affects ranking.
+- DNSSEC validation is probed independently from the main ranking. A `NO_VALIDATION_SIGNAL` result is not proof that the server never validates DNSSEC.
 - ICMP ping is not used for ranking because DNS servers commonly rate-limit or block ping while still answering DNS.
 - DNS query timing is measured from this server's current network path. A VPS outside Iran cannot reproduce an Iranian ISP's resolver reachability or latency.
 - The tool does not silently change DNS during `--test`.
