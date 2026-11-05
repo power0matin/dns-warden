@@ -281,7 +281,7 @@ query_dns() {
   local -a transport_args=(+dnssec)
   [[ "${transport}" == "tcp" ]] && transport_args+=(+tcp)
 
-  local out status answers query_ms flags ad dig_rc
+  local out status answers query_ms flags ad dig_rc answer_data
   set +e
   out="$(dig "${transport_args[@]}" +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" "${domain}" A +noall +comments +stats +answer 2>&1)"
   dig_rc=$?
@@ -291,56 +291,71 @@ query_dns() {
   answers="$(awk -F'ANSWER: ' '/QUERY:/ {split($2,a,","); print a[1]; exit}' <<< "${out}")"
   query_ms="$(awk '/Query time:/ {print $4; exit}' <<< "${out}")"
   flags="$(awk '/flags:/ {if (match($0,/flags: [^;]+/)) {x=substr($0,RSTART,RLENGTH); sub(/^flags: /,"",x); print x; exit}}' <<< "${out}")"
+  answer_data="$(awk '$4 == "A" {if (result != "") result=result ","; result=result $5} END {print result}' <<< "${out}")"
 
   [[ "${status}" =~ ^[A-Z]+$ ]] || status="NO_RESPONSE"
   [[ "${answers}" =~ ^[0-9]+$ ]] || answers=0
   [[ "${query_ms}" =~ ^[0-9]+$ ]] || query_ms=9999
   ad="NO"
   [[ " ${flags} " == *" ad "* ]] && ad="YES"
+  answer_data="${answer_data//|//}"
+  answer_data="${answer_data//$'\t'/ }"
 
   local ok=0
   if [[ "${status}" == "NOERROR" ]] && (( answers > 0 )) && (( dig_rc == 0 )); then
     ok=1
   fi
 
-  printf "%s|%s|%s|%s|%s\n" "${status}" "${query_ms}" "${ok}" "${ad}" "${answers}"
+  printf "%s|%s|%s|%s|%s|%s\n" "${status}" "${query_ms}" "${ok}" "${ad}" "${answers}" "${answer_data}"
 }
 
 detect_bind_fingerprint() {
-  local endpoint="$1" raw value lower kind
+  local endpoint="$1" raw status value lower kind dig_rc
   set +e
-  raw="$(dig +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" version.bind TXT CH +short 2>/dev/null)"
+  raw="$(dig +time="${DNS_TIMEOUT}" +tries=1 "@${endpoint}" version.bind TXT CH +noall +comments +answer +stats 2>&1)"
+  dig_rc=$?
   set -e
-  value="$(tr -d '"' <<< "${raw}" | head -n 1 | tr -d '\r')"
+
+  status="$(awk -F'status: ' '/HEADER/ {split($2,a,","); print a[1]; exit}' <<< "${raw}")"
+  value="$(awk '$4 == "TXT" {for (i=5; i<=NF; i++) {gsub(/^"|"$/, "", $i); printf "%s%s", (i==5 ? "" : " "), $i} exit}' <<< "${raw}")"
   value="$(trim "${value}")"
   lower="${value,,}"
   value="${value//|//}"
   value="${value//$'\t'/ }"
-  [[ -n "${value}" ]] || value="(hidden or refused)"
 
-  kind="HIDDEN"
-  if [[ "${lower}" == *bind* ]]; then
-    kind="BIND_SIGNATURE"
-  elif [[ "${value}" =~ ^(9|10)\.[0-9]+ ]]; then
-    kind="BIND_VERSION_LIKE"
-  elif [[ "${value}" != "(hidden or refused)" ]]; then
-    kind="OTHER_VERSION"
+  if (( dig_rc != 0 )) || grep -Eqi 'communications error|timed out|connection refused|no servers could be reached|network is unreachable|connection reset|malformed message' <<< "${raw}"; then
+    kind="NO_RESPONSE"
+    value="(query failed)"
+  elif [[ "${status}" == "NOERROR" && -n "${value}" ]]; then
+    if [[ "${lower}" == *bind* ]]; then
+      kind="BIND_SIGNATURE"
+    elif [[ "${value}" =~ ^[0-9]+\.[0-9]+([.-]|$) ]]; then
+      kind="BIND_VERSION_LIKE"
+    elif [[ "${lower}" == *unbound* || "${lower}" == *powerdns* || "${lower}" == *dnsmasq* || "${lower}" == *knot* || "${lower}" == *technitium* ]]; then
+      kind="OTHER_IMPLEMENTATION"
+    else
+      kind="CUSTOM_VERSION"
+    fi
+  else
+    kind="HIDDEN"
+    value="(hidden or refused)"
   fi
+
   printf "%s|%s" "${kind}" "${value}"
 }
 
 test_dns_endpoint() {
   local endpoint="$1"
   local successful=0 total=0 latency_sum=0 latency_samples=0 ad_count=0
-  local domain repetition result status query_ms ok ad answers
+  local domain repetition result status query_ms ok ad answers answer_data
 
   for domain in "${DNS_TEST_DOMAINS[@]}"; do
     for ((repetition=1; repetition<=DNS_COUNT; repetition++)); do
       result="$(query_dns "${endpoint}" "${domain}" "udp")"
-      IFS='|' read -r status query_ms ok ad answers <<< "${result}"
+      IFS='|' read -r status query_ms ok ad answers answer_data <<< "${result}"
       total=$((total + 1))
       [[ "${ad}" == "YES" ]] && ad_count=$((ad_count + 1))
-      printf "%s|%s|UDP|%s|%s|%s|%s|\n" "${endpoint}" "${domain}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
+      printf "%s|%s|UDP|%s|%s|%s|%s|%s|\n" "${endpoint}" "${domain}" "${status}" "${answers}" "${query_ms}" "${ad}" "${answer_data}" >> "${LAST_DETAILS_FILE}"
       if [[ "${ok}" == "1" ]]; then
         successful=$((successful + 1))
         if [[ "${query_ms}" =~ ^[0-9]+$ ]] && (( query_ms < 9999 )); then
@@ -358,20 +373,42 @@ test_dns_endpoint() {
 
   local tcp_result tcp_status bind_result bind_status bind_value
   tcp_result="$(query_dns "${endpoint}" "github.com" "tcp")"
-  IFS='|' read -r status query_ms ok ad answers <<< "${tcp_result}"
+  IFS='|' read -r status query_ms ok ad answers answer_data <<< "${tcp_result}"
   if [[ "${ok}" == "1" ]]; then tcp_status="OK"; else tcp_status="FAIL"; fi
-  printf "%s|github.com|TCP|%s|%s|%s|%s|\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|github.com|TCP|%s|%s|%s|%s|%s|\n" "${endpoint}" "${status}" "${answers}" "${query_ms}" "${ad}" "${answer_data}" >> "${LAST_DETAILS_FILE}"
+
+  local dnssec_good dnssec_bad good_status good_ad bad_status dnssec_status
+  dnssec_good="$(query_dns "${endpoint}" "cloudflare.com" "udp")"
+  IFS='|' read -r good_status query_ms ok good_ad answers answer_data <<< "${dnssec_good}"
+  dnssec_bad="$(query_dns "${endpoint}" "dnssec-failed.org" "udp")"
+  IFS='|' read -r bad_status query_ms ok ad answers answer_data <<< "${dnssec_bad}"
+
+  if [[ "${bad_status}" == "SERVFAIL" && "${good_ad}" == "YES" ]]; then
+    dnssec_status="VALIDATES"
+  elif [[ "${bad_status}" == "SERVFAIL" ]]; then
+    dnssec_status="LIKELY_VALIDATES"
+  elif [[ "${bad_status}" == "NOERROR" && "${good_ad}" == "YES" ]]; then
+    dnssec_status="INCONSISTENT"
+  elif [[ "${bad_status}" == "NOERROR" ]]; then
+    dnssec_status="NO_VALIDATION_SIGNAL"
+  else
+    dnssec_status="INCONCLUSIVE"
+  fi
+  printf "%s|cloudflare.com|DNSSEC-GOOD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${good_status}" "${answers}" "${query_ms}" "${good_ad}" "${answer_data}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|dnssec-failed.org|DNSSEC-BAD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_status}" "${answers}" "${query_ms}" "${ad}" "${answer_data}" >> "${LAST_DETAILS_FILE}"
 
   bind_result="$(detect_bind_fingerprint "${endpoint}")"
   bind_status="${bind_result%%|*}"
   bind_value="${bind_result#*|}"
-  printf "%s|version.bind|CHAOS|%s|||%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|version.bind|CHAOS|%s||||%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
 
-  local score
-  score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + (avg*10) }')"
+  local tcp_penalty score
+  tcp_penalty=0
+  [[ "${tcp_status}" == "OK" ]] || tcp_penalty=1000
+  score="$(awk -v ok="${successful}" -v total="${total}" -v avg="${avg_ms}" -v tcp="${tcp_penalty}" 'BEGIN { printf "%.2f", ((total-ok)*10000) + tcp + (avg*10) }')"
 
-  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
-    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}" "${ad_count}" "${bind_value}"
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "${endpoint}" "${successful}" "${total}" "${avg_ms}" "${tcp_status}" "${bind_status}" "${score}" "${ad_count}" "${bind_value}" "${dnssec_status}"
 }
 
 
