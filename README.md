@@ -8,7 +8,7 @@
 - Average DNS query latency for successful answers.
 - TCP DNS query reachability. TCP failures receive a ranking penalty because reliable DNS service should support both transports.
 - DNSSEC behavior using a signed positive control (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). The broken domain is queried normally and with Checking Disabled (`CD`).
-- DNSSEC validation is classified separately as `VALIDATES`, `DOES_NOT_VALIDATE`, or `INCONCLUSIVE`. `VALIDATES` requires a successful positive control, normal `SERVFAIL` for the broken domain, and a successful answer when `CD` is set.
+- DNSSEC validation is classified separately as `VALIDATES`, `LIKELY_VALIDATES`, `DOES_NOT_VALIDATE`, `INCONSISTENT`, or `INCONCLUSIVE`. `VALIDATES` additionally requires the signed positive control to return `AD=YES); when the normal/CD negative-control difference is present but positive AD is absent, the result is only `LIKELY_VALIDATES`.
 - The positive control is queried with `+adflag`. Its response signal is reported independently as `AD_PRESENT`, `AD_ABSENT`, or `INCONCLUSIVE`; an absent AD flag is not automatically treated as proof that validation is disabled.
 - Optional `version.bind` CHAOS TXT fingerprint. Network errors are reported as `NO_RESPONSE`; a hidden response is **inconclusive**. Only an explicit BIND version-like response is classified as a BIND candidate.
 - Per-query A-record values, answer count, RCODE, latency, AD flag, and DNSSEC test mode in a separate detail report.
@@ -98,7 +98,7 @@ sudo bash ./dns-warden.sh --apply 178.22.122.100 --method auto --yes
 Backups are stored under `/var/backups/dns-warden`; benchmark reports are stored under `/var/log/dns-warden`.
 The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, test type (UDP, TCP, DNSSEC positive, DNSSEC normal, or DNSSEC CD), RCODE, answer count, A-record values, query time, AD flag, and the BIND fingerprint result. The summary's `AD count` is from the main test matrix; the separate `AD signal` comes from the signed positive control queried with `+adflag`.
 
-The `DNSSEC validation` result compares the intentionally-broken domain under normal checking and with `+cdflag`. A `VALIDATES` result is strong operational evidence when normal checking returns `SERVFAIL` but the CD query returns answers. `DOES_NOT_VALIDATE` means the broken-domain control returned answers in both modes. `INCONCLUSIVE` is used when the control behavior does not fit either pattern. These probes are not a formal audit; upstream filtering, transient failures, or changes to the test domain can affect the result. An `AD_ABSENT` signal is reported separately and must not be confused with the negative-control result.
+The `DNSSEC validation` result compares the intentionally-broken domain under normal checking and with `+cdflag`. `VALIDATES` requires normal `SERVFAIL`, CD-mode answers, a successful positive control, and `AD_PRESENT` on that positive control. If the normal/CD difference is present but the positive control lacks AD, the result is `LIKELY_VALIDATES`: strong but incomplete operational evidence. `DOES_NOT_VALIDATE` means the broken-domain control returned answers in both modes with no positive AD signal. `INCONSISTENT` means the positive control reports AD while the broken domain is still accepted. Other control failures are `INCONCLUSIVE`. These probes are not a formal audit; upstream filtering, transient failures, or changes to the test domain can affect the result. The separate AD signal must not be confused with the negative-control result.
 
 
 ## Catalog format
@@ -109,7 +109,7 @@ Edit `dns-list.txt`: one IP address or hostname per line; blank lines and `#` co
 
 - Benchmarking sends DNS queries to every configured resolver. This reveals the tested domain names to those resolver operators.
 - A resolver may be reachable by UDP but not TCP, or vice versa; both are tested and TCP failure affects ranking.
-- DNSSEC validation is probed independently from the main ranking. The normal/CD comparison and the AD signal are deliberately separate; neither alone is a complete security audit.
+- DNSSEC validation is probed independently from the main ranking. The normal/CD comparison and positive-control AD signal are considered together; neither alone is a complete security audit.
 - ICMP ping is not used for ranking because DNS servers commonly rate-limit or block ping while still answering DNS.
 - DNS query timing is measured from this server's current network path. A VPS outside Iran cannot reproduce an Iranian ISP's resolver reachability or latency.
 - The tool does not silently change DNS during `--test`.
