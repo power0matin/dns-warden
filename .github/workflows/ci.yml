@@ -1,0 +1,43 @@
+name: DNS Warden CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Bash syntax
+        run: bash -n dns-warden.sh
+      - name: Validate resolver catalog
+        run: |
+          python3 - <<'PY'
+          import ipaddress
+          from pathlib import Path
+
+          entries = []
+          for raw in Path("dns-list.txt").read_text().splitlines():
+              value = raw.split("#", 1)[0].strip()
+              if not value:
+                  continue
+              try:
+                  ipaddress.ip_address(value)
+              except ValueError:
+                  # Hostnames are allowed by the list format.
+                  if any(ch.isspace() for ch in value) or "/" in value:
+                      raise SystemExit(f"Invalid resolver entry: {value}")
+              entries.append(value)
+
+          if not entries:
+              raise SystemExit("Resolver catalog is empty")
+          if len(entries) != len(set(entries)):
+              raise SystemExit("Duplicate resolver entries found")
+          print(f"Validated {len(entries)} unique resolver entries")
+          PY
