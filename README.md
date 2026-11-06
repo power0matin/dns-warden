@@ -1,137 +1,104 @@
-# dns-warden — DNS Resolver Benchmark & Safe Switcher
+<h1 align="center">dns-warden</h1>
 
-`dns-warden` is a Bash CLI/TUI for Ubuntu servers. It benchmarks configured DNS resolvers by sending **real DNS queries directly to each resolver**, ranks working endpoints, and can apply a selected resolver with backup/restore support.
+<p align="center">
+  Benchmark DNS resolvers with real queries and switch between them safely on Ubuntu.
+</p>
 
-## What it measures
+<p align="center">
+  <a href="https://github.com/power0matin/dns-warden/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/power0matin/dns-warden/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/power0matin/dns-warden/releases"><img src="https://img.shields.io/github/v/release/power0matin/dns-warden?style=flat-square" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/power0matin/dns-warden?style=flat-square" alt="License"></a>
+</p>
 
-- UDP DNS A-query success rate against a small, fixed domain matrix.
-- Average DNS query latency for successful answers.
-- TCP DNS query reachability. TCP failures receive a ranking penalty because reliable DNS service should support both transports.
-- DNSSEC behavior using a signed positive control (`cloudflare.com`) and the intentionally broken test domain (`dnssec-failed.org`). The broken domain is queried normally and with Checking Disabled (`CD`).
-- DNSSEC validation is classified separately as `VALIDATES`, `LIKELY_VALIDATES`, `DOES_NOT_VALIDATE`, `INCONSISTENT`, or `INCONCLUSIVE`. `VALIDATES` additionally requires the signed positive control to return `AD=YES); when the normal/CD negative-control difference is present but positive AD is absent, the result is only `LIKELY_VALIDATES`.
-- The positive control is queried with `+adflag`. Its response signal is reported independently as `AD_PRESENT`, `AD_ABSENT`, or `INCONCLUSIVE`; an absent AD flag is not automatically treated as proof that validation is disabled.
-- Optional `version.bind` CHAOS TXT fingerprint. Network errors are reported as `NO_RESPONSE`; a hidden response is **inconclusive**. Only an explicit BIND version-like response is classified as a BIND candidate.
-- Per-query A-record values, answer count, RCODE, latency, AD flag, and DNSSEC test mode in a separate detail report.
-- Resolver list includes Iranian public/community candidates, ISP-routed/private candidates, and international public baselines.
+<p align="center"><a href="README.fa.md">فارسی</a></p>
 
-**Important:** DNS cannot change your public IP or bypass IP-geolocation sanctions. It may help only where a service is affected by DNS-level filtering or resolution. DNS latency is not download throughput. Private addresses such as `10.202.x.x`, `10.x.x.x`, `172.16/12` and `192.168/16` are tested only if the server's network routes them.
+## Overview
+
+`dns-warden` is a single-file Bash tool with an interactive menu and a scriptable CLI. It sends real DNS queries directly to every resolver in a list, ranks the ones that work, and applies your choice with an automatic backup you can restore.
+
+ICMP ping is not used. Many resolvers block it while still answering DNS, so ranking is based on actual DNS answers.
+
+## Features
+
+- **Direct DNS queries** over UDP against a fixed domain matrix, with success rate and average latency.
+- **TCP check.** Resolvers that fail over TCP are penalised in the ranking.
+- **DNSSEC probe** that reports `VALIDATES`, `LIKELY_VALIDATES`, `DOES_NOT_VALIDATE`, `INCONSISTENT` or `INCONCLUSIVE`, plus a separate AD-flag signal.
+- **Optional `version.bind` fingerprint**, with a `--bind-only` filter.
+- **Safe apply.** Backs up `/etc/resolv.conf`, supports `systemd-resolved`, and restores from the menu.
+- **Detailed reports** per query (RCODE, answers, latency, AD flag).
+- **Editable resolver list** with Iranian, ISP-routed and international public candidates.
 
 ## Requirements
 
-- Ubuntu 20.04+
-- Root access for applying DNS; tests can also be run as root by the current script.
-- `bash`, `dig` (`dnsutils`), `getent`, `awk`, `sort`.
-
-Install the DNS query tool:
+- Ubuntu 20.04 or newer
+- `bash`, `dig` (package `dnsutils`), `getent`
+- Root privileges (the script re-runs itself with `sudo` when needed)
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y dnsutils
+sudo apt-get update && sudo apt-get install -y dnsutils
 ```
 
-## Run a benchmark on a server
+## Install
 
-Recommended: clone the repository and inspect the script before running it as root.
+Download the latest release, verify it, and run it:
 
 ```bash
-git clone https://github.com/power0matin/dns-warden.git
-cd dns-warden
-set -euo pipefail
-bash -n dns-warden.sh
-python3 - <<'PY'
-import ipaddress
-from pathlib import Path
-
-entries = []
-for raw in Path("dns-list.txt").read_text().splitlines():
-    value = raw.split("#", 1)[0].strip()
-    if not value:
-        continue
-    ipaddress.ip_address(value)
-    entries.append(value)
-
-assert entries, "DNS catalog is empty"
-assert len(entries) == len(set(entries)), "Duplicate DNS entries found"
-print(f"{len(entries)} unique IP resolvers")
-PY
-sudo bash ./dns-warden.sh --test
+curl -fsSLO https://github.com/power0matin/dns-warden/releases/latest/download/dns-warden.sh
+curl -fsSLO https://github.com/power0matin/dns-warden/releases/latest/download/dns-list.txt
+curl -fsSLO https://github.com/power0matin/dns-warden/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-Tune repetitions and timeout:
+Or clone the repository:
 
 ```bash
-sudo bash ./dns-warden.sh --test --count 2 --timeout 2
+git clone https://github.com/power0matin/dns-warden.git && cd dns-warden
 ```
 
-Only show resolvers that explicitly expose a BIND-like fingerprint:
+## Usage
 
 ```bash
-sudo bash ./dns-warden.sh --test --bind-only
+sudo bash dns-warden.sh                    # interactive menu
+sudo bash dns-warden.sh --test             # benchmark only, no changes
+sudo bash dns-warden.sh --test --count 2 --timeout 2
+sudo bash dns-warden.sh --test --bind-only
+sudo bash dns-warden.sh --apply 1.1.1.1 --method auto --yes
 ```
 
-This filter is intentionally conservative. Many legitimate BIND servers hide `version.bind`; those are marked `HIDDEN` and cannot be confirmed from the outside.
+| Option | Description |
+| --- | --- |
+| `--test` | Run the benchmark and print the ranked report. |
+| `--apply <ip\|host>` | Apply a resolver. Requires `--yes`. Hostnames are resolved to an IP first. |
+| `--method auto\|resolved\|force` | `auto` uses `systemd-resolved` when it manages `resolv.conf`; `force` rewrites the file. |
+| `--count <1-5>` | Queries per domain (default 1). |
+| `--timeout <1-10>` | Seconds per query (default 1). |
+| `--list <path>` | Use a different resolver list. |
+| `--bind-only` | Show only resolvers with a BIND-like fingerprint. |
+| `-V`, `--version` | Print the version. |
 
-## Interactive menu
+Backups are stored in `/var/backups/dns-warden` and reports in `/var/log/dns-warden`. Restoring a backup from the menu also offers to remove the `systemd-resolved` drop-in created by this tool.
 
-```bash
-sudo bash ./dns-warden.sh
-```
+## Resolver list
 
-1. Test all entries.
-2. Select a resolver from the ranked results and apply it.
-3. Inspect the current DNS configuration.
-4. Edit the resolver list.
-5. Restore a previous backup.
+Edit `dns-list.txt`: one IP address or hostname per line, `#` for comments. Entries are community candidates and are **not endorsed or verified**. Private ISP addresses only work inside that ISP's network. Remove anything you do not trust.
 
-## Apply from CLI
+## Notes
 
-Only apply after reviewing the benchmark. The script requires an explicit `--yes` flag in non-interactive mode.
+- Testing reveals the queried domain names to each resolver operator.
+- Results reflect the network path of the machine you run it on; a server abroad cannot reproduce results from an Iranian ISP.
+- DNSSEC and fingerprint probes are indicative, not a security audit.
+- DNS does not change your public IP and cannot bypass IP-based restrictions.
+- `--test` never modifies your DNS configuration.
 
-```bash
-sudo bash ./dns-warden.sh --apply 178.22.122.100 --method auto --yes
-```
-
-- `auto`: use `systemd-resolved` when its managed symlink is detected; otherwise use the direct file method.
-- `resolved`: write a systemd-resolved drop-in.
-- `force`: replace `/etc/resolv.conf`; this can break a symlink and should be avoided unless intentional.
-
-Backups are stored under `/var/backups/dns-warden`; benchmark reports are stored under `/var/log/dns-warden`.
-The ranked report is accompanied by a per-query report in `/var/log/dns-warden/*.details.txt`. It includes resolver, queried domain, test type (UDP, TCP, DNSSEC positive, DNSSEC normal, or DNSSEC CD), RCODE, answer count, A-record values, query time, AD flag, and the BIND fingerprint result. The summary's `AD count` is from the main test matrix; the separate `AD signal` comes from the signed positive control queried with `+adflag`.
-
-The `DNSSEC validation` result compares the intentionally-broken domain under normal checking and with `+cdflag`. `VALIDATES` requires normal `SERVFAIL`, CD-mode answers, a successful positive control, and `AD_PRESENT` on that positive control. If the normal/CD difference is present but the positive control lacks AD, the result is `LIKELY_VALIDATES`: strong but incomplete operational evidence. `DOES_NOT_VALIDATE` means the broken-domain control returned answers in both modes with no positive AD signal. `INCONSISTENT` means the positive control reports AD while the broken domain is still accepted. Other control failures are `INCONCLUSIVE`. These probes are not a formal audit; upstream filtering, transient failures, or changes to the test domain can affect the result. The separate AD signal must not be confused with the negative-control result.
-
-
-## Catalog format
-
-Edit `dns-list.txt`: one IP address or hostname per line; blank lines and `#` comments are ignored. Entries are candidates gathered from public lists and provider reports. Their current ownership, public reachability, privacy policy, free tier, and BIND implementation are **not independently guaranteed** by inclusion in this list. Remove entries you do not trust.
-
-## Safety and interpretation
-
-- Benchmarking sends DNS queries to every configured resolver. This reveals the tested domain names to those resolver operators.
-- A resolver may be reachable by UDP but not TCP, or vice versa; both are tested and TCP failure affects ranking.
-- DNSSEC validation is probed independently from the main ranking. The normal/CD comparison and positive-control AD signal are considered together; neither alone is a complete security audit.
-- ICMP ping is not used for ranking because DNS servers commonly rate-limit or block ping while still answering DNS.
-- DNS query timing is measured from this server's current network path. A VPS outside Iran cannot reproduce an Iranian ISP's resolver reachability or latency.
-- The tool does not silently change DNS during `--test`.
-- Do not apply an unknown resolver solely because it has a low latency score.
-
-## Development checks
+## Development
 
 ```bash
 bash -n dns-warden.sh
-python3 - <<'PY'
-from pathlib import Path
-entries = []
-for line in Path("dns-list.txt").read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#"):
-        entries.append(line)
-assert entries, "DNS list is empty"
-assert len(entries) == len(set(entries)), "Duplicate DNS entries found"
-print(f"{len(entries)} unique resolver entries")
-PY
+shellcheck -S warning dns-warden.sh tests/*.sh
+bash tests/test-dnssec-classification.sh
+bash tests/test-apply-target.sh
 ```
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE) © [Matin Shahabadi](https://github.com/power0matin)

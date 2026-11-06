@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# DNS Warden - Ubuntu-only DNS tester & switcher (Rathole_v2-style TUI)
-# Safe for: Ubuntu 20.04+
-# No external deps beyond core utils; uses less/nano if present.
+# DNS Warden - DNS resolver benchmark and safe switcher for Ubuntu
+# Supported: Ubuntu 20.04+
+# Requires: bash, dig (dnsutils), getent; uses less/nano when available.
 
 ###############################################################################
 # Loader: sudo re-exec support
 ###############################################################################
+case "${1:-}" in
+  -h|--help|-V|--version) DNS_WARDEN_LAUNCHED=1 ;;
+esac
+
 if [[ -z "${DNS_WARDEN_LAUNCHED:-}" ]]; then
   export DNS_WARDEN_LAUNCHED=1
 
@@ -75,7 +79,7 @@ FLAG_YES=0
 FLAG_LIST_OVERRIDE=""
 
 ###############################################################################
-# Colors (Rathole_v2-like)
+# Colors
 ###############################################################################
 is_tty() { [[ -t 1 ]]; }
 
@@ -129,6 +133,7 @@ detect_ubuntu_or_exit() {
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release. This script requires Ubuntu 20.04+."
   local os_id os_ver
   # source only in a subshell to avoid polluting environment
+  # shellcheck source=/dev/null
   mapfile -t _os < <( ( . /etc/os-release >/dev/null 2>&1; printf '%s\n%s\n' "${ID:-}" "${VERSION_ID:-}" ) )
   os_id="${_os[0]:-}"
   os_ver="${_os[1]:-0}"
@@ -182,8 +187,9 @@ is_ipv4() {
 
 is_ipv6() {
   local ip="$1"
-  [[ "${ip}" == *:* ]] || return 1
+  [[ "${ip}" == *:*:* ]] || return 1
   [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  (( ${#ip} <= 39 )) || return 1
   return 0
 }
 
@@ -448,14 +454,16 @@ test_dns_endpoint() {
     "${bad_cd_status}" "${bad_cd_answers}")"
   dnssec_ad_status="$(classify_dnssec_ad_signal "${good_status}" "${good_answers}" "${good_ad}")"
 
-  printf "%s|cloudflare.com|DNSSEC_POSITIVE|%s|%s|%s|%s|%s|\n" "${endpoint}" "${good_status}" "${good_answers}" "${good_ms}" "${good_ad}" "${good_data}" >> "${LAST_DETAILS_FILE}"
-  printf "%s|dnssec-failed.org|DNSSEC_NORMAL|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_status}" "${bad_answers}" "${bad_ms}" "${bad_ad}" "${bad_data}" >> "${LAST_DETAILS_FILE}"
-  printf "%s|dnssec-failed.org|DNSSEC_CD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_cd_status}" "${bad_cd_answers}" "${bad_cd_ms}" "${bad_cd_ad}" "${bad_cd_data}" >> "${LAST_DETAILS_FILE}"
+  {
+    printf "%s|cloudflare.com|DNSSEC_POSITIVE|%s|%s|%s|%s|%s|\n" "${endpoint}" "${good_status}" "${good_answers}" "${good_ms}" "${good_ad}" "${good_data}"
+    printf "%s|dnssec-failed.org|DNSSEC_NORMAL|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_status}" "${bad_answers}" "${bad_ms}" "${bad_ad}" "${bad_data}"
+    printf "%s|dnssec-failed.org|DNSSEC_CD|%s|%s|%s|%s|%s|\n" "${endpoint}" "${bad_cd_status}" "${bad_cd_answers}" "${bad_cd_ms}" "${bad_cd_ad}" "${bad_cd_data}"
+  } >> "${LAST_DETAILS_FILE}"
 
   bind_result="$(detect_bind_fingerprint "${endpoint}")"
   bind_status="${bind_result%%|*}"
   bind_value="${bind_result#*|}"
-  printf "%s|version.bind|CHAOS|%s||||%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
+  printf "%s|version.bind|CHAOS|%s|||||%s\n" "${endpoint}" "${bind_status}" "${bind_value}" >> "${LAST_DETAILS_FILE}"
 
   local tcp_penalty score
   tcp_penalty=0
@@ -707,9 +715,26 @@ verify_dns() {
   pager_file "${out_file}"
 }
 
+normalize_dns_target() {
+  local target
+  target="$(trim "${1:-}")"
+  [[ -n "${target}" ]] || return 1
+
+  if is_ipv4 "${target}" || is_ipv6 "${target}"; then
+    printf "%s" "${target}"
+    return 0
+  fi
+
+  [[ "${target}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+
+  local resolved
+  resolved="$(resolve_prefer_v4_then_v6 "${target}")" || return 1
+  printf "%s" "${resolved#* }"
+}
+
 apply_dns_auto() {
-  local dns="$1"
-  local method="${FLAG_METHOD:-auto}"
+  local dns method="${FLAG_METHOD:-auto}"
+  dns="$(normalize_dns_target "$1")" || die "Invalid DNS target '$1': expected an IPv4/IPv6 address or a resolvable hostname."
 
   if [[ "${method}" == "auto" ]]; then
     if resolv_conf_symlink_managed_by_systemd; then
@@ -729,7 +754,28 @@ apply_dns_auto() {
 ###############################################################################
 # Backups restore
 ###############################################################################
-list_backups() { ls -1 "${BACKUP_DIR}"/resolv.conf.* 2>/dev/null | grep -v '\.meta$' || true; }
+revert_resolved_dropin() {
+  local dropin_file="/etc/systemd/resolved.conf.d/99-dns-warden.conf"
+  [[ -f "${dropin_file}" ]] || return 0
+
+  if confirm "Remove the dns-warden systemd-resolved drop-in (${dropin_file})?"; then
+    rm -f "${dropin_file}"
+    if systemd_resolved_active; then
+      systemctl restart systemd-resolved
+    fi
+    log_info "Removed systemd-resolved drop-in: ${dropin_file}"
+  else
+    log_warn "Drop-in kept: DNS may still be forced by ${dropin_file}"
+  fi
+}
+
+list_backups() {
+  local f
+  for f in "${BACKUP_DIR}"/resolv.conf.*; do
+    [[ -e "${f}" && "${f}" != *.meta ]] && printf "%s\n" "${f}"
+  done
+  return 0
+}
 
 meta_get() {
   local file="$1" key="$2"
@@ -797,6 +843,7 @@ restore_backup_cli() {
     log_info "Restored content from: ${chosen}"
   fi
 
+  revert_resolved_dropin
   verify_dns
 }
 
@@ -820,6 +867,7 @@ clear_screen() {
 
 ubuntu_pretty() {
   if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
     . /etc/os-release
     printf "%s %s" "${NAME:-Ubuntu}" "${VERSION_ID:-}"
   else
@@ -1034,13 +1082,14 @@ test_dns_cli() {
 ###############################################################################
 usage() {
   cat <<EOF
-${SCRIPT_NAME} v${APP_VERSION} - Ubuntu-only DNS tester & switcher (Rathole_v2-style TUI)
+${SCRIPT_NAME} v${APP_VERSION} - DNS resolver benchmark and safe switcher for Ubuntu
 
 Usage:
   sudo bash ${SCRIPT_NAME}
 
 Options:
   -h, --help              Show this help
+  -V, --version           Show version
   --list <path>           Use an alternate DNS list file
   --count <n>             DNS query repetitions per domain (default: ${DNS_COUNT_DEFAULT})
   --timeout <sec>         DNS query timeout in seconds (default: ${DNS_TIMEOUT_DEFAULT})
@@ -1056,6 +1105,7 @@ parse_args() {
   while (( $# > 0 )); do
     case "$1" in
       -h|--help) usage; exit 0 ;;
+      -V|--version) printf "%s\n" "${APP_VERSION}"; exit 0 ;;
       --list)    [[ $# -ge 2 ]] || die "--list requires a path"; FLAG_LIST_OVERRIDE="$2"; shift 2 ;;
       --count)      [[ $# -ge 2 ]] || die "--count requires a number"; DNS_COUNT="$2"; shift 2 ;;
       --timeout)    [[ $# -ge 2 ]] || die "--timeout requires seconds"; DNS_TIMEOUT="$2"; shift 2 ;;
@@ -1167,10 +1217,10 @@ menu_loop() {
 ###############################################################################
 main() {
   detect_script_dir
+  parse_args "$@"
+
   detect_ubuntu_or_exit
   ensure_root
-
-  parse_args "$@"
 
   init_tmp
   ensure_dirs

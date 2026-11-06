@@ -83,7 +83,6 @@
 # Shatel
 85.15.1.14
 85.15.1.15
-# Pars Online (reported)
 #
 # IRAN - private / ISP-routed ONLY (not public Internet resolvers)
 # 403 Online

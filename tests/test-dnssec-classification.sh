@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export DNS_WARDEN_LAUNCHED=1
 export DNS_WARDEN_SOURCE_ONLY=1
-# shellcheck source=../dns-warden.sh
+# shellcheck source=../dns-warden.sh disable=SC1091
 source "${ROOT_DIR}/dns-warden.sh"
 
 assert_eq() {
@@ -146,5 +147,12 @@ grep -q '^192\.0\.2\.53|cloudflare\.com|DNSSEC_POSITIVE|NOERROR|2|' "${LAST_DETA
 grep -q '^192\.0\.2\.53|dnssec-failed\.org|DNSSEC_NORMAL|SERVFAIL|0|' "${LAST_DETAILS_FILE}"
 grep -q '^192\.0\.2\.53|dnssec-failed\.org|DNSSEC_CD|NOERROR|2|' "${LAST_DETAILS_FILE}"
 printf "PASS: per-query report contains all three DNSSEC probe rows\n"
+
+chaos_fingerprint="$(awk -F'|' '$2 == "version.bind" && $3 == "CHAOS" {print $9}' "${LAST_DETAILS_FILE}")"
+[[ -n "${chaos_fingerprint}" && "${chaos_fingerprint}" != "(query failed)" ]] || {
+  printf "FAIL: CHAOS fingerprint is not in column 9 of the details report\n" >&2
+  exit 1
+}
+printf "PASS: CHAOS fingerprint is written to the fingerprint column\n"
 
 printf "All DNSSEC classification and integration tests passed.\n"

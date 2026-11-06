@@ -16,8 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate Bash syntax
         run: bash -n dns-warden.sh
+      - name: Lint with ShellCheck
+        run: shellcheck -S warning dns-warden.sh tests/*.sh
       - name: Test DNSSEC classification and query flags
         run: bash tests/test-dnssec-classification.sh
+      - name: Test apply-target validation and backup listing
+        run: bash tests/test-apply-target.sh
       - name: Validate resolver catalog
         run: |
           python3 - <<'PY'
