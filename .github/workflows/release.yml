@@ -21,8 +21,8 @@ jobs:
           fi
       - name: Run checks
         run: |
-          bash -n dns-warden.sh
-          shellcheck -S warning dns-warden.sh tests/*.sh
+          bash -n dns-warden.sh install.sh
+          shellcheck -S warning dns-warden.sh install.sh tests/*.sh
           bash tests/test-dnssec-classification.sh
           bash tests/test-apply-target.sh
       - name: Build release assets

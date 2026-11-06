@@ -40,6 +40,28 @@ sudo apt-get update && sudo apt-get install -y dnsutils
 
 ## نصب
 
+با یک دستور، `dns-warden` نصب می‌شود و منو باز می‌شود:
+
+</div>
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/install.sh)
+```
+
+<div dir="rtl" align="right">
+
+نصب‌کننده آخرین ریلیز را دانلود می‌کند، checksum از نوع SHA-256 را بررسی می‌کند، در صورت نبود `dnsutils` آن را نصب می‌کند و دستور `dns-warden` را اضافه می‌کند. بعد از آن فقط `sudo dns-warden` را اجرا کنید.
+
+گزینه‌های نصب‌کننده بعد از دستور می‌آیند، مثلاً `--no-run`:
+
+| گزینه | توضیح |
+| --- | --- |
+| `--version vX.Y.Z` | نصب یک ریلیز مشخص به‌جای آخرین ریلیز |
+| `--no-run` | فقط نصب، بدون باز کردن منو |
+| `--uninstall` | حذف dns-warden؛ بکاپ‌ها و گزارش‌ها حفظ می‌شوند |
+
+### نصب دستی
+
 آخرین ریلیز را دانلود، بررسی و اجرا کنید:
 
 </div>
@@ -68,14 +90,16 @@ git clone https://github.com/power0matin/dns-warden.git && cd dns-warden
 </div>
 
 ```bash
-sudo bash dns-warden.sh                    # منوی تعاملی
-sudo bash dns-warden.sh --test             # فقط تست، بدون تغییر
-sudo bash dns-warden.sh --test --count 2 --timeout 2
-sudo bash dns-warden.sh --test --bind-only
-sudo bash dns-warden.sh --apply 1.1.1.1 --method auto --yes
+sudo dns-warden                            # منوی تعاملی
+sudo dns-warden --test                     # فقط تست، بدون تغییر
+sudo dns-warden --test --count 2 --timeout 2
+sudo dns-warden --test --bind-only
+sudo dns-warden --apply 1.1.1.1 --method auto --yes
 ```
 
 <div dir="rtl" align="right">
+
+در نصب دستی یا کلون، به‌جای `sudo dns-warden` از `sudo bash dns-warden.sh` استفاده کنید.
 
 | گزینه | توضیح |
 | --- | --- |
@@ -107,8 +131,8 @@ sudo bash dns-warden.sh --apply 1.1.1.1 --method auto --yes
 </div>
 
 ```bash
-bash -n dns-warden.sh
-shellcheck -S warning dns-warden.sh tests/*.sh
+bash -n dns-warden.sh install.sh
+shellcheck -S warning dns-warden.sh install.sh tests/*.sh
 bash tests/test-dnssec-classification.sh
 bash tests/test-apply-target.sh
 ```

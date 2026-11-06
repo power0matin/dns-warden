@@ -40,6 +40,24 @@ sudo apt-get update && sudo apt-get install -y dnsutils
 
 ## Install
 
+One command installs `dns-warden` and opens the menu:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/install.sh)
+```
+
+The installer downloads the latest release, verifies its SHA-256 checksum, installs `dnsutils` if missing, and adds the `dns-warden` command. Afterwards just run `sudo dns-warden`.
+
+Installer options go after the command, for example `bash <(curl -fsSL https://raw.githubusercontent.com/power0matin/dns-warden/main/install.sh) --no-run`:
+
+| Option | Description |
+| --- | --- |
+| `--version vX.Y.Z` | Install a specific release instead of the latest. |
+| `--no-run` | Install only, do not open the menu. |
+| `--uninstall` | Remove dns-warden. Backups and reports are kept. |
+
+### Manual install
+
 Download the latest release, verify it, and run it:
 
 ```bash
@@ -58,12 +76,14 @@ git clone https://github.com/power0matin/dns-warden.git && cd dns-warden
 ## Usage
 
 ```bash
-sudo bash dns-warden.sh                    # interactive menu
-sudo bash dns-warden.sh --test             # benchmark only, no changes
-sudo bash dns-warden.sh --test --count 2 --timeout 2
-sudo bash dns-warden.sh --test --bind-only
-sudo bash dns-warden.sh --apply 1.1.1.1 --method auto --yes
+sudo dns-warden                            # interactive menu
+sudo dns-warden --test                     # benchmark only, no changes
+sudo dns-warden --test --count 2 --timeout 2
+sudo dns-warden --test --bind-only
+sudo dns-warden --apply 1.1.1.1 --method auto --yes
 ```
+
+From a manual install or a clone, use `sudo bash dns-warden.sh` instead of `sudo dns-warden`.
 
 | Option | Description |
 | --- | --- |
@@ -93,8 +113,8 @@ Edit `dns-list.txt`: one IP address or hostname per line, `#` for comments. Entr
 ## Development
 
 ```bash
-bash -n dns-warden.sh
-shellcheck -S warning dns-warden.sh tests/*.sh
+bash -n dns-warden.sh install.sh
+shellcheck -S warning dns-warden.sh install.sh tests/*.sh
 bash tests/test-dnssec-classification.sh
 bash tests/test-apply-target.sh
 ```
